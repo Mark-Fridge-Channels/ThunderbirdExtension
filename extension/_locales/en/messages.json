@@ -1,0 +1,4 @@
+{
+  "extensionName": { "message": "Mail Automation Agent" },
+  "extensionDescription": { "message": "Local email automation engine: receive commands via Native Messaging and execute Thunderbird API actions." }
+}
