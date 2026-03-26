@@ -16,6 +16,7 @@
 1. 启动本地服务（与扩展通信）：
    ```bash
    node minimal-server/server.js
+   
    ```
 2. 在 Thunderbird 中已加载本扩展（见上「安装扩展」）。
 

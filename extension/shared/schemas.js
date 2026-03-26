@@ -1,18 +1,8 @@
 /**
- * Payload validation helpers. All external input must pass schema checks.
- * We do minimal runtime checks (no external JSON Schema lib) to avoid dependencies.
+ * Bridge V1 payload validation. Actions are camelCase only.
  */
 
-const ACTIONS = new Set([
-  "switch_account_context",
-  "send_email",
-  "open_message",
-  "star_message",
-  "add_contact",
-  "forward_message",
-  "reply_message",
-  "resolve_message",
-]);
+const ACTIONS = new Set(["listAccounts", "sendEmail", "replyEmail", "findMessages", "restoreToInbox"]);
 
 function isNonEmptyString(v) {
   return typeof v === "string" && v.trim().length > 0;
@@ -26,130 +16,153 @@ function isObject(v) {
   return v !== null && typeof v === "object" && !Array.isArray(v);
 }
 
-function isArrayOfStrings(v) {
-  return Array.isArray(v) && v.every((x) => typeof x === "string");
-}
-
 export function validateEnvelope(obj) {
   if (!isObject(obj)) return { ok: false, error: "Envelope must be an object" };
   if (!isNonEmptyString(obj.request_id)) return { ok: false, error: "request_id required" };
   if (!isNonEmptyString(obj.action)) return { ok: false, error: "action required" };
-  if (!ACTIONS.has(obj.action)) return { ok: false, error: `Unknown action: ${obj.action}` };
+  if (!ACTIONS.has(obj.action)) return { ok: false, error: `Unknown action: ${obj.action} (Bridge V1 camelCase only)` };
   if (!isObject(obj.payload) && obj.payload !== undefined) return { ok: false, error: "payload must be object" };
   return { ok: true, payload: obj.payload || {} };
 }
 
-export function validateSwitchAccountPayload(p) {
+export function validateListAccountsPayload(p) {
   if (!isObject(p)) return { ok: false, error: "payload must be object" };
-  const accountSelector = p.accountId ?? p.email ?? p.identityId;
-  if (accountSelector === undefined || accountSelector === null) {
-    return { ok: false, error: "One of accountId, email, or identityId required" };
+  if (p.includeSubFolders !== undefined && typeof p.includeSubFolders !== "boolean") {
+    return { ok: false, error: "includeSubFolders must be boolean" };
   }
-  if (!isString(accountSelector)) return { ok: false, error: "account selector must be string" };
   return { ok: true, payload: p };
+}
+
+function recipientArraysOk(to, cc, bcc) {
+  const norm = (x) => {
+    if (x == null) return [];
+    if (Array.isArray(x)) return x.every((y) => isString(y));
+    return isString(x);
+  };
+  return norm(to) && norm(cc) && norm(bcc);
 }
 
 export function validateSendEmailPayload(p) {
   if (!isObject(p)) return { ok: false, error: "payload must be object" };
-  // identityId/accountId optional: handler may use context from switch_account_context
-  const to = p.to;
-  if (to === undefined || (Array.isArray(to) && to.length === 0) || (isString(to) && !to.trim()))
-    return { ok: false, error: "to required" };
-  if (p.dry_run && typeof p.dry_run !== "boolean") return { ok: false, error: "dry_run must be boolean" };
+  if (!recipientArraysOk(p.to, p.cc, p.bcc)) return { ok: false, error: "to, cc, bcc must be strings or string arrays" };
+  const to = p.to == null ? [] : Array.isArray(p.to) ? p.to : [p.to];
+  const cc = p.cc == null ? [] : Array.isArray(p.cc) ? p.cc : [p.cc];
+  const bcc = p.bcc == null ? [] : Array.isArray(p.bcc) ? p.bcc : [p.bcc];
+  const hasTo = to.some((s) => isString(s) && s.trim());
+  const hasCc = cc.some((s) => isString(s) && s.trim());
+  const hasBcc = bcc.some((s) => isString(s) && s.trim());
+  if (!hasTo && !hasCc && !hasBcc) {
+    return { ok: false, error: "At least one recipient required among to, cc, bcc" };
+  }
+  if (p.body == null || !isString(p.body) || !p.body.length) {
+    return { ok: false, error: "body is required" };
+  }
+  if (!p.identityId && !p.accountId) {
+    return { ok: false, error: "identityId or accountId required" };
+  }
+  if (p.identityId != null && !isString(p.identityId)) return { ok: false, error: "identityId must be string" };
+  if (p.accountId != null && !isString(p.accountId)) return { ok: false, error: "accountId must be string" };
+  if (p.bodyFormat != null && p.bodyFormat !== "plain" && p.bodyFormat !== "html") {
+    return { ok: false, error: "bodyFormat must be plain | html" };
+  }
+  if (p.sendMode != null && !["default", "sendNow", "sendLater"].includes(p.sendMode)) {
+    return { ok: false, error: "sendMode must be default | sendNow | sendLater" };
+  }
+  if (p.saveCopyToFolderId !== undefined && p.saveCopyToFolderId !== null && typeof p.saveCopyToFolderId !== "string") {
+    return { ok: false, error: "saveCopyToFolderId must be string when provided" };
+  }
+  if (p.deliveryFormat != null && !["auto", "both", "html", "plaintext"].includes(p.deliveryFormat)) {
+    return { ok: false, error: "invalid deliveryFormat" };
+  }
   return { ok: true, payload: p };
 }
 
-export function validateOpenMessagePayload(p) {
+export function validateReplyEmailPayload(p) {
   if (!isObject(p)) return { ok: false, error: "payload must be object" };
-  if (!isNonEmptyString(p.accountId)) return { ok: false, error: "accountId required" };
-  const hasQuery =
-    isNonEmptyString(p.headerMessageId) ||
-    isNonEmptyString(p.subject) ||
-    isNonEmptyString(p.from) ||
-    isNonEmptyString(p.to) ||
-    (p.fromDate && (p.toDate || true));
-  if (!hasQuery && !isNonEmptyString(p.folderPath))
-    return { ok: false, error: "Need folderPath or query (headerMessageId/subject/from/to/date)" };
+  if (p.messageId == null || (!Number.isFinite(Number(p.messageId)) && !isNonEmptyString(String(p.messageId)))) {
+    return { ok: false, error: "messageId is required" };
+  }
+  if (p.body == null || !isString(p.body) || !p.body.length) {
+    return { ok: false, error: "body is required" };
+  }
+  if (!p.identityId && !p.accountId) {
+    return { ok: false, error: "identityId or accountId required" };
+  }
+  if (p.identityId != null && !isString(p.identityId)) return { ok: false, error: "identityId must be string" };
+  if (p.accountId != null && !isString(p.accountId)) return { ok: false, error: "accountId must be string" };
+  if (p.replyType != null && !["replyToSender", "replyToAll", "replyToList"].includes(p.replyType)) {
+    return { ok: false, error: "replyType invalid" };
+  }
+  if (p.bodyFormat != null && p.bodyFormat !== "plain" && p.bodyFormat !== "html") {
+    return { ok: false, error: "bodyFormat must be plain | html" };
+  }
+  if (p.sendMode != null && !["default", "sendNow", "sendLater"].includes(p.sendMode)) {
+    return { ok: false, error: "sendMode invalid" };
+  }
+  if (p.saveCopyToFolderId !== undefined && p.saveCopyToFolderId !== null && typeof p.saveCopyToFolderId !== "string") {
+    return { ok: false, error: "saveCopyToFolderId must be string when provided" };
+  }
   return { ok: true, payload: p };
 }
 
-export function validateStarMessagePayload(p) {
+export function validateFindMessagesPayload(p) {
   if (!isObject(p)) return { ok: false, error: "payload must be object" };
-  if (!isNonEmptyString(p.accountId)) return { ok: false, error: "accountId required" };
-  const hasTarget =
-    isNonEmptyString(p.headerMessageId) ||
-    isNonEmptyString(p.messageId) ||
-    (isNonEmptyString(p.folderPath) && isNonEmptyString(p.subject));
-  if (!hasTarget) return { ok: false, error: "Need messageId, headerMessageId, or folderPath+subject" };
-  if (p.starred !== undefined && typeof p.starred !== "boolean")
-    return { ok: false, error: "starred must be boolean" };
+  const has =
+    p.accountId != null ||
+    p.folderId != null ||
+    (p.author && isString(p.author)) ||
+    (p.recipients && isString(p.recipients)) ||
+    (p.subject && isString(p.subject)) ||
+    (p.body && isString(p.body)) ||
+    (p.fullText && isString(p.fullText)) ||
+    (p.headerMessageId && isString(p.headerMessageId)) ||
+    p.fromDate != null ||
+    p.toDate != null ||
+    p.read !== undefined ||
+    p.flagged !== undefined ||
+    p.junk !== undefined ||
+    p.fromMe !== undefined ||
+    p.toMe !== undefined ||
+    p.attachment !== undefined;
+  if (!has) {
+    return { ok: false, error: "At least one search filter is required" };
+  }
+  if (p.includeSubFolders !== undefined && typeof p.includeSubFolders !== "boolean") {
+    return { ok: false, error: "includeSubFolders must be boolean" };
+  }
+  if (p.limit != null && typeof p.limit !== "number" && typeof p.limit !== "string") {
+    return { ok: false, error: "limit must be number" };
+  }
   return { ok: true, payload: p };
 }
 
-export function validateAddContactPayload(p) {
+export function validateRestoreToInboxPayload(p) {
   if (!isObject(p)) return { ok: false, error: "payload must be object" };
-  if (!isNonEmptyString(p.email)) return { ok: false, error: "email required" };
-  const parentId = p.addressBookId ?? p.parentId;
-  if (!isNonEmptyString(parentId)) return { ok: false, error: "addressBookId or parentId required" };
-  return { ok: true, payload: p };
-}
-
-export function validateForwardMessagePayload(p) {
-  if (!isObject(p)) return { ok: false, error: "payload must be object" };
-  if (!isNonEmptyString(p.accountId)) return { ok: false, error: "accountId required" };
-  const hasTarget =
-    isNonEmptyString(p.messageId) || isNonEmptyString(p.headerMessageId);
-  if (!hasTarget) return { ok: false, error: "messageId or headerMessageId required" };
-  const to = p.to ?? p.recipients;
-  if (
-    (Array.isArray(to) && to.length === 0) ||
-    (isString(to) && !to.trim())
-  )
-    return { ok: false, error: "to or recipients required" };
-  return { ok: true, payload: p };
-}
-
-export function validateReplyMessagePayload(p) {
-  if (!isObject(p)) return { ok: false, error: "payload must be object" };
-  const hasTarget =
-    isNonEmptyString(p.messageId) || isNonEmptyString(p.headerMessageId) ||
-    (isNonEmptyString(p.folderPath) && isNonEmptyString(p.subject));
-  if (!hasTarget) return { ok: false, error: "messageId, headerMessageId, or folderPath+subject required" };
-  return { ok: true, payload: p };
-}
-
-export function validateResolveMessagePayload(p) {
-  if (!isObject(p)) return { ok: false, error: "payload must be object" };
-  if (!isNonEmptyString(p.accountId)) return { ok: false, error: "accountId required" };
-  const hasQuery =
-    isNonEmptyString(p.headerMessageId) ||
-    isNonEmptyString(p.subject) ||
-    isNonEmptyString(p.from) ||
-    isNonEmptyString(p.to) ||
-    (p.fromDate && (p.toDate || true));
-  if (!hasQuery && !isNonEmptyString(p.folderPath))
-    return { ok: false, error: "Need folderPath or query (headerMessageId/subject/from/to/date)" };
+  if (p.messageId == null || (!Number.isFinite(Number(p.messageId)) && !isNonEmptyString(String(p.messageId)))) {
+    return { ok: false, error: "messageId is required" };
+  }
+  if (!isNonEmptyString(p.inboxFolderId)) return { ok: false, error: "inboxFolderId is required" };
+  if (p.clearJunk !== undefined && typeof p.clearJunk !== "boolean") {
+    return { ok: false, error: "clearJunk must be boolean" };
+  }
+  if (p.treatAsUserAction !== undefined && typeof p.treatAsUserAction !== "boolean") {
+    return { ok: false, error: "treatAsUserAction must be boolean" };
+  }
   return { ok: true, payload: p };
 }
 
 export function getValidator(action) {
   switch (action) {
-    case "switch_account_context":
-      return validateSwitchAccountPayload;
-    case "send_email":
+    case "listAccounts":
+      return validateListAccountsPayload;
+    case "sendEmail":
       return validateSendEmailPayload;
-    case "open_message":
-      return validateOpenMessagePayload;
-    case "star_message":
-      return validateStarMessagePayload;
-    case "add_contact":
-      return validateAddContactPayload;
-    case "forward_message":
-      return validateForwardMessagePayload;
-    case "reply_message":
-      return validateReplyMessagePayload;
-    case "resolve_message":
-      return validateResolveMessagePayload;
+    case "replyEmail":
+      return validateReplyEmailPayload;
+    case "findMessages":
+      return validateFindMessagesPayload;
+    case "restoreToInbox":
+      return validateRestoreToInboxPayload;
     default:
       return () => ({ ok: false, error: "Unknown action" });
   }

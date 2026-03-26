@@ -19,9 +19,9 @@
     "accountsRead",
     "messagesRead",
     "messagesUpdate",
+    "messagesMove",
     "compose",
     "compose.send",
-    "addressBooks",
     "storage"
   ],
   "host_permissions": [

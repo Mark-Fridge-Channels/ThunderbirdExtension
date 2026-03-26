@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 /**
- * Smoke test for scheme A: POST /command (switch_account_context), wait for response.
- * Usage: TEST_ACCOUNT_EMAIL=you@example.com node minimal-server/smoke_test.js
+ * Minimal HTTP smoke: POST /command with Bridge V1 listAccounts.
+ *
+ * Usage: node minimal-server/smoke_test.js
+ * Prereq: node minimal-server/server.js + Thunderbird extension loaded.
  */
 
 const BASE = "http://127.0.0.1:3939";
-const email = process.env.TEST_ACCOUNT_EMAIL || "mark@fridgechannels.com";
 
 async function main() {
   const requestId = `smoke-${Date.now()}`;
@@ -14,14 +15,15 @@ async function main() {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       request_id: requestId,
-      action: "switch_account_context",
-      payload: { email },
+      action: "listAccounts",
+      payload: { includeSubFolders: true },
     }),
   });
   const data = await res.json();
   console.log(JSON.stringify(data, null, 2));
   if (data.success) {
-    console.log("\nOK: accountId =", data.result?.accountId, "folders =", data.result?.folders?.length ?? 0);
+    const n = data.result?.accounts?.length ?? 0;
+    console.log("\nOK: accounts =", n);
   } else {
     process.exitCode = 1;
   }
@@ -29,6 +31,6 @@ async function main() {
 
 main().catch((e) => {
   console.error(e.message || e);
-  console.error("Ensure: 1) node minimal-server/server.js is running 2) extension is loaded in Thunderbird");
+  console.error("Ensure: 1) node minimal-server/server.js  2) extension loaded in Thunderbird");
   process.exit(1);
 });

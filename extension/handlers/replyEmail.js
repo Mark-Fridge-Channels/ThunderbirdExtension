@@ -1,5 +1,6 @@
 /**
- * Bridge V1: sendEmail — compose.beginNew + compose.sendMessage.
+ * Bridge V1: replyEmail — compose.beginReply + compose.sendMessage.
+ * messageId is Thunderbird internal id (numeric), not RFC Message-ID header.
  */
 
 import { normalizeSendResult } from "../shared/bridgeNormalize.js";
@@ -14,19 +15,14 @@ async function resolveIdentity(accountId, identityId) {
   return def?.id ?? null;
 }
 
-function asRecipientArray(v) {
-  if (v == null) return [];
-  if (Array.isArray(v)) return v.map((x) => String(x)).filter((s) => s.length > 0);
-  return String(v).trim() ? [String(v).trim()] : [];
-}
+const REPLY_TYPES = new Set(["replyToSender", "replyToAll", "replyToList"]);
 
-export async function handleSendEmail({ payload }) {
-  const to = asRecipientArray(payload.to);
-  const cc = asRecipientArray(payload.cc);
-  const bcc = asRecipientArray(payload.bcc);
-  if (!to.length && !cc.length && !bcc.length) {
-    return { success: false, error: makeError(CODES.VALIDATION, "At least one of to, cc, bcc must be non-empty") };
+export async function handleReplyEmail({ payload }) {
+  const mid = payload.messageId;
+  if (mid == null || mid === "" || !Number.isFinite(Number(mid))) {
+    return { success: false, error: makeError(CODES.VALIDATION, "messageId is required (numeric Thunderbird id)") };
   }
+  const messageId = Number(mid);
   if (payload.body == null || String(payload.body).length === 0) {
     return { success: false, error: makeError(CODES.VALIDATION, "body is required") };
   }
@@ -39,13 +35,14 @@ export async function handleSendEmail({ payload }) {
     };
   }
 
+  const replyType = payload.replyType ?? "replyToSender";
+  if (!REPLY_TYPES.has(replyType)) {
+    return { success: false, error: makeError(CODES.VALIDATION, "replyType must be replyToSender | replyToAll | replyToList") };
+  }
+
   const bodyFormat = payload.bodyFormat === "html" ? "html" : "plain";
   const details = {
     identityId,
-    to,
-    cc,
-    bcc,
-    subject: payload.subject ?? "",
     attachVCard: payload.attachVCard === true,
   };
   if (bodyFormat === "html") {
@@ -66,9 +63,9 @@ export async function handleSendEmail({ payload }) {
   }
 
   try {
-    const tab = await browser.compose.beginNew(undefined, details);
+    const tab = await browser.compose.beginReply(messageId, replyType, details);
     if (!tab?.id) {
-      return { success: false, error: makeError(CODES.API_ERROR, "compose.beginNew did not return a tab") };
+      return { success: false, error: makeError(CODES.API_ERROR, "compose.beginReply did not return a tab") };
     }
     const result = await browser.compose.sendMessage(tab.id, { mode: sendMode });
     return { success: true, result: normalizeSendResult(result) };

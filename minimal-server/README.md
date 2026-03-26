@@ -1,5 +1,34 @@
 # 方案 A：扩展 fetch 本机服务（无 Native Messaging）
 
+## 0. Warmup Executor（Notion Queue → 扩展执行 → 回写）
+
+> 目标：由 **minimal-server 自己轮询 Notion Queue**，把动作投递给扩展执行，并将结果回写 Notion。
+> 外部程序不再需要读队列或调用 `/command`（`/command` 仍保留作手动调试入口）。
+
+### 0.1 配置
+
+1. 复制示例配置：
+
+   ```bash
+   cp minimal-server/config.example.json minimal-server/config.json
+   ```
+
+2. 编辑 `minimal-server/config.json`：
+
+   - `notion.token`: Notion integration token（明文落盘在本机）
+   - `notion.database_id`: Queue database_id
+   - `executor.poll_interval_ms`: 默认 60000（60s）
+   - `executor.page_size`: 默认 20
+   - `executor.address_book_id`：Bridge V1 下 Notion 队列只做 **Send / Reply**，该项已无意义，可留空。
+
+### 0.2 运行
+
+```bash
+node minimal-server/server.js
+```
+
+启动日志会打印已加载的配置摘要，并显示 executor 启动信息。
+
 ## 1. 最小验证（确认扩展能访问 127.0.0.1）
 
 1. 启动本机服务：
@@ -18,22 +47,24 @@
    - **若出现**：方案 A 可行，可继续用下方「切换账号」测试。  
    - **若不出现**：Thunderbird 可能不允许扩展 fetch 127.0.0.1，需查 host_permissions 或 CSP。
 
-## 2. 切换账号端到端测试
+## 2. Bridge V1：端到端探测（listAccounts）
 
-1. 保持 `node minimal-server/server.js` 运行；Thunderbird 已加载 **Mail Automation Agent** 扩展。
-2. 在**另一终端**执行（把 `你的邮箱@example.com` 换成你在 TB 里配置的邮箱）：
+1. 保持 `node minimal-server/server.js` 运行；Thunderbird 已加载扩展。
+2. 另一终端：
    ```bash
    curl -s -X POST http://127.0.0.1:3939/command \
      -H "Content-Type: application/json" \
-     -d '{"request_id":"test-1","action":"switch_account_context","payload":{"email":"你的邮箱@example.com"}}'
+     -d '{"request_id":"test-1","action":"listAccounts","payload":{"includeSubFolders":true}}'
    ```
-3. 响应应包含 `"success":true` 及 `result.accountId`、`result.folders` 等。  
-   若长时间无响应，检查扩展控制台是否有错误；扩展每 2 秒轮询一次 `/next`，通常几秒内会取到命令并执行。
+3. `success: true` 时 `result.accounts` 为账号树（含 `specialUse`）。完整 HTTP 测试见 `minimal-server/bridge_v1_test.js`。
 
 ## 3. 用 Node 脚本测试（可选）
 
 ```bash
-TEST_ACCOUNT_EMAIL=你的邮箱 node demos/smoke_test.js
-# 或覆盖 6 个动作：
-TEST_ACCOUNT_EMAIL=你的邮箱 node demos/smoke_all_actions.js
+node minimal-server/smoke_test.js
+node minimal-server/bridge_v1_test.js
+# 真实发信/移动邮件需设置 SEND_REAL=1，见 bridge_v1_test.js 文件头注释
+
+# 发信 → 等待对方回信 → 自动 replyEmail（场景脚本，默认 AdrianZ@fcpartners.co ↔ oh.duang@gmail.com）
+SEND_REAL=1 node minimal-server/bridge_v1_wait_reply_flow.js
 ```

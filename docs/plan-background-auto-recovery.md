@@ -1,6 +1,6 @@
 # Feature Implementation Plan: Background 自动恢复（alarms）
 
-**Overall Progress:** `0%`
+**Overall Progress:** `67%` (2/3 steps implemented; Step 3 is manual verification)
 
 ## TLDR
 
@@ -15,14 +15,14 @@
 
 ## Tasks
 
-- [ ] 🟥 **Step 1: manifest 增加 alarms 权限**
-  - [ ] 🟥 在 `extension/manifest.json` 的 `permissions` 中加入 `"alarms"`。
+- [x] 🟩 **Step 1: manifest 增加 alarms 权限**
+  - [x] 🟩 在 `extension/manifest.json` 的 `permissions` 中加入 `"alarms"`。
 
-- [ ] 🟥 **Step 2: background.js 接入 alarms**
-  - [ ] 🟥 在脚本顶部增加常量（如 `ALARM_PERIOD_MINUTES = 0.5`），便于后续改为 1 做兼容。
-  - [ ] 🟥 在顶层注册 `browser.alarms.onAlarm.addListener(callback)`；callback 内若 `alarm.name === "poll"` 则调用现有 `poll()`。
-  - [ ] 🟥 在 `init()` 内首次完整执行分支（即通过 session 防重入后）：在 `setInterval` 之后，先 `browser.alarms.get("poll")`，若不存在则 `browser.alarms.create("poll", { periodInMinutes: ALARM_PERIOD_MINUTES })`。
-  - [ ] 🟥 保持现有 `init` 防重入、`ping`、`setInterval(poll, POLL_MS)`、`onStartup` 与 `init()` 调用不变。
+- [x] 🟩 **Step 2: background.js 接入 alarms**
+  - [x] 🟩 在脚本顶部增加常量（如 `ALARM_PERIOD_MINUTES = 0.5`），便于后续改为 1 做兼容。
+  - [x] 🟩 在顶层注册 `browser.alarms.onAlarm.addListener(callback)`；callback 内若 `alarm.name === "poll"` 则调用现有 `poll()`。
+  - [x] 🟩 在 `init()` 内首次完整执行分支（即通过 session 防重入后）：在 `setInterval` 之后，先 `browser.alarms.get("poll")`，若不存在则 `browser.alarms.create("poll", { periodInMinutes: ALARM_PERIOD_MINUTES })`。
+  - [x] 🟩 保持现有 `init` 防重入、`ping`、`setInterval(poll, POLL_MS)`、`onStartup` 与 `init()` 调用不变。
 
 - [ ] 🟥 **Step 3: 自测与可选验证**
   - [ ] 🟥 在 Thunderbird 中重载扩展，确认无报错；确认 GET /next 仍每 2s 发生（setInterval 正常）。
