@@ -144,13 +144,20 @@ export async function handleFindMessages({ payload }) {
         if (n) {
           if (includeBody) {
             try {
+              // Ensure `body` is always present on the returned item.
+              n.body = "";
               // getFull requires messagesRead and can be slower; only enabled when explicitly requested.
               const full = await browser.messages.getFull(m.id, { decodeContent: true });
               const extracted = extractBodyFromMessagePart(full);
               const body = extracted.plain || extracted.htmlFallback || "";
               n.body = body;
-            } catch (_) {
+            } catch (e) {
               // Keep header data even if body extraction fails.
+              // Also expose error so callers can debug why `body` is missing/empty.
+              n.body = n.body ?? "";
+              n.bodyError = {
+                message: e?.message ?? String(e),
+              };
             }
           }
           items.push(n);
