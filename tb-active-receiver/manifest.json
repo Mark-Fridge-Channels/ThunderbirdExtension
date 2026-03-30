@@ -27,8 +27,7 @@
     "accountsRead",
     "alarms",
     "messagesRead",
-    "storage",
-    "mailTabs"
+    "storage"
   ],
   "optional_host_permissions": ["http://*/*", "https://*/*"],
   "experiment_apis": {
