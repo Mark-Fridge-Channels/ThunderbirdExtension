@@ -1,1 +1,5 @@
 minimal-server/config.json
+extension-*
+tb-active-receiver-*
+extension.xpi
+tb-active-receiver.xpi
