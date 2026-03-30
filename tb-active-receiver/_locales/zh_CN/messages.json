@@ -1,0 +1,30 @@
+{
+  "extensionDescription": {
+    "message": "独立收信扩展：定时器、原生收取邮件（Experiment）、新邮件回信线索、可选 HTTP 上报。",
+    "description": "扩展简短描述"
+  },
+  "actionTitle": {
+    "message": "TB Active Receiver（独立版）",
+    "description": "工具栏按钮提示"
+  },
+  "optionsTitle": {
+    "message": "TB Active Receiver — 设置",
+    "description": "选项页标题"
+  },
+  "optEnabled": { "message": "启用定时收信" },
+  "optPollMinutes": { "message": "轮询间隔（分钟）" },
+  "optPollAll": { "message": "每次轮询：检查所有账号" },
+  "optMonitorAllFolders": { "message": "监听所有文件夹的新邮件" },
+  "optSettleMs": { "message": "收信后等待多久再执行收件箱标签回退（毫秒）" },
+  "optReportUrl": { "message": "上报 URL（POST JSON，留空则禁用）" },
+  "optMailTabFallback": { "message": "若收信后未收到新邮件事件：将邮件标签切到各账号收件箱" },
+  "optSave": { "message": "保存" },
+  "optPermissionDenied": { "message": "未授予该站点网络权限；上报可能失败。" },
+  "popupStatus": { "message": "状态" },
+  "popupFetchAll": { "message": "立即检查所有账号" },
+  "popupFetchCurrent": { "message": "检查当前账号（三栏所选）" },
+  "popupFetchNote": { "message": "通过 Experiment 调用原生收件箱收信。" },
+  "optionsPermissionHint": {
+    "message": "保存上报地址时可能会请求对应网站的网络权限。"
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "extensionDescription": {
+    "message": "Standalone active sync: alarms, native Get New Messages (Experiment), new-mail reply hints, optional HTTP report.",
+    "description": "Short description for manifest and AMO."
+  },
+  "actionTitle": {
+    "message": "TB Active Receiver (standalone)",
+    "description": "Toolbar button tooltip"
+  },
+  "optionsTitle": {
+    "message": "TB Active Receiver — Settings",
+    "description": "Options page title"
+  },
+  "optEnabled": { "message": "Enable polling" },
+  "optPollMinutes": { "message": "Poll interval (minutes)" },
+  "optPollAll": { "message": "On each tick: fetch all accounts (all-accounts check mail)" },
+  "optMonitorAllFolders": { "message": "Listen for new mail in all folders" },
+  "optSettleMs": { "message": "Wait after fetch before Inbox tab fallback (ms)" },
+  "optReportUrl": { "message": "Report URL (POST JSON, empty to disable)" },
+  "optMailTabFallback": { "message": "If no new-mail event after fetch: switch mail tab to each Inbox" },
+  "optSave": { "message": "Save" },
+  "optPermissionDenied": { "message": "Origin permission not granted; report may fail until allowed." },
+  "popupStatus": { "message": "Status" },
+  "popupFetchAll": { "message": "Fetch all now" },
+  "popupFetchCurrent": { "message": "Fetch current account (3-pane selection)" },
+  "popupFetchNote": { "message": "Uses native inbox fetch (Experiment)." },
+  "optionsPermissionHint": {
+    "message": "Saving a report URL may prompt for network permission for that site."
+  }
+}

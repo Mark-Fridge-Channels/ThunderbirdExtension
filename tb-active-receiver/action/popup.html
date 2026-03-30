@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body {
+        font: message-box;
+        min-width: 16rem;
+        padding: 0.5rem 0.75rem;
+      }
+      button {
+        display: block;
+        width: 100%;
+        margin: 0.35rem 0;
+      }
+      pre {
+        white-space: pre-wrap;
+        font-size: 0.75rem;
+        max-width: 22rem;
+        margin: 0.5rem 0 0;
+      }
+    </style>
+  </head>
+  <body>
+    <div data-i18n="popupStatus">Status</div>
+    <pre id="out"></pre>
+    <button type="button" id="fetchAll" data-i18n="popupFetchAll">Fetch all now</button>
+    <button type="button" id="fetchCurrent" data-i18n="popupFetchCurrent">Fetch current account</button>
+    <p style="font-size: 0.8rem; color: GrayText; margin: 0.25rem 0 0" data-i18n="popupFetchNote"></p>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

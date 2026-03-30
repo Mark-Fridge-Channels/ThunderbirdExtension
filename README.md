@@ -2,6 +2,8 @@
 
 通过本地 HTTP 服务（minimal-server）接收命令，在 Thunderbird 中执行切换账号、发信、打开/标星邮件、添加联系人、转发等动作。
 
+**独立收信扩展**：`tb-active-receiver/` 为单独的 MailExtension + Experiment（`TB Active Receiver`），只负责账号发现、定时/手动触发原生收信、`onNewMailReceived` 回信线索与可选 HTTP 上报；与发信桥接（`extension/`）物理分离。打包：`./scripts/build-tb-active-receiver-xpi.sh` → `tb-active-receiver.xpi`。
+
 ## 安装扩展
 
 - **开发**：Thunderbird → 附加组件 → 从文件安装附加组件 → 选择 **`extension`** 文件夹（内含 `manifest.json` 的那一层）。**修改扩展代码后必须重新加载**：在该扩展卡片上点击「重新加载」或重启 Thunderbird，否则仍会运行旧脚本。

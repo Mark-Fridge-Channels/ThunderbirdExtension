@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title data-i18n="optionsTitle">TB Active Receiver — Settings</title>
+    <style>
+      body {
+        font: message-box;
+        max-width: 42rem;
+        padding: 1rem;
+      }
+      label {
+        display: block;
+        margin: 0.75rem 0 0.25rem;
+      }
+      input[type="text"] {
+        width: 100%;
+        box-sizing: border-box;
+      }
+      button {
+        margin-top: 1rem;
+      }
+      .hint {
+        color: GrayText;
+        font-size: 0.9rem;
+        margin-top: 0.5rem;
+      }
+    </style>
+  </head>
+  <body>
+    <h1 data-i18n="optionsTitle">TB Active Receiver — Settings</h1>
+
+    <label><input type="checkbox" id="enabled" /> <span data-i18n="optEnabled">Enable polling</span></label>
+
+    <label for="pollMinutes" data-i18n="optPollMinutes">Poll interval (minutes)</label>
+    <input type="number" id="pollMinutes" min="1" max="1440" step="1" />
+
+    <label><input type="checkbox" id="pollAll" /> <span data-i18n="optPollAll">Fetch all accounts each tick</span></label>
+
+    <label
+      ><input type="checkbox" id="monitorAllFolders" />
+      <span data-i18n="optMonitorAllFolders">Listen for new mail in all folders</span></label
+    >
+
+    <label for="settleMs" data-i18n="optSettleMs">Settle delay before Inbox fallback (ms)</label>
+    <input type="number" id="settleMs" min="500" max="120000" step="100" />
+
+    <label for="reportUrl" data-i18n="optReportUrl">Report URL</label>
+    <input type="text" id="reportUrl" placeholder="https://example.com/hook" autocomplete="off" />
+
+    <label
+      ><input type="checkbox" id="mailTabFallback" />
+      <span data-i18n="optMailTabFallback">Mail tab Inbox fallback</span></label
+    >
+
+    <p class="hint" data-i18n="optionsPermissionHint"></p>
+
+    <button type="button" id="save" data-i18n="optSave">Save</button>
+    <p id="status" aria-live="polite"></p>
+
+    <script type="module" src="options.js"></script>
+  </body>
+</html>

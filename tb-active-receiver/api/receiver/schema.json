@@ -1,0 +1,34 @@
+[
+  {
+    "namespace": "receiver",
+    "description": "Native Get New Messages via Thunderbird mail internals (Experiment). Retest after major Thunderbird upgrades.",
+    "functions": [
+      {
+        "name": "fetchCurrentAccount",
+        "type": "function",
+        "description": "Trigger Get New Messages for the account implied by the active mail 3-pane selection (current account).",
+        "async": true,
+        "parameters": []
+      },
+      {
+        "name": "fetchAccount",
+        "type": "function",
+        "description": "Trigger Get New Messages for the given mail account id (WebExtension accounts id / key).",
+        "async": true,
+        "parameters": [
+          {
+            "name": "accountId",
+            "type": "string"
+          }
+        ]
+      },
+      {
+        "name": "fetchAllAccounts",
+        "type": "function",
+        "description": "Trigger Get New Messages for every mail account that has an Inbox.",
+        "async": true,
+        "parameters": []
+      }
+    ]
+  }
+]
