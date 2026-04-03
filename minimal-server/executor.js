@@ -320,6 +320,63 @@ function normalizeEmail(text) {
   return extractEmail(text || "").trim().toLowerCase();
 }
 
+function escapeHtml(text) {
+  return String(text || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function sanitizeHttpUrl(url) {
+  const u = String(url || "").trim();
+  return /^https?:\/\/\S+$/i.test(u) ? u : "";
+}
+
+/**
+ * Convert markdown links like [label](https://example.com) into HTML anchors.
+ * Keeps other text escaped and preserves line breaks via <br>.
+ */
+function markdownLinksToHtml(text) {
+  const src = String(text || "").replace(/\r\n/g, "\n");
+  const re = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/gi;
+  let last = 0;
+  let out = "";
+  let m;
+  while ((m = re.exec(src)) != null) {
+    out += escapeHtml(src.slice(last, m.index));
+    const label = escapeHtml(m[1]);
+    const href = sanitizeHttpUrl(m[2]);
+    if (href) {
+      out += `<a href="${escapeHtml(href)}">${label}</a>`;
+    } else {
+      out += escapeHtml(m[0]);
+    }
+    last = re.lastIndex;
+  }
+  out += escapeHtml(src.slice(last));
+  return out.replace(/\n/g, "<br>");
+}
+
+function hasMarkdownHttpLinks(text) {
+  return /\[[^\]]+\]\((https?:\/\/[^\s)]+)\)/i.test(String(text || ""));
+}
+
+function resolveBodyForCompose(rawBody, explicitBodyFormat) {
+  const body = String(rawBody || "");
+  if (explicitBodyFormat === "html") {
+    return { bodyFormat: "html", body };
+  }
+  if (explicitBodyFormat === "plain") {
+    return { bodyFormat: "plain", body };
+  }
+  if (hasMarkdownHttpLinks(body)) {
+    return { bodyFormat: "html", body: markdownLinksToHtml(body) };
+  }
+  return { bodyFormat: "plain", body };
+}
+
 async function queryInboundPages(notionCfg, databaseId, pageSize) {
   const filter = {
     and: [
@@ -739,6 +796,8 @@ async function executeOne({ cfg, enqueueAndWait }, row) {
 function mapActionToEnvelope({ row, externalEventId, accountId, identityId, requestId, replyMessageId, migratedPayload, partnerEmail }) {
   const t = row.actionText;
   const toMailbox = normalizeEmail(partnerEmail || row.counterpartyEmail);
+  const effectiveBodyFormat = migratedPayload?.bodyFormat ?? row.bodySourceFormat;
+  const bodyResolved = resolveBodyForCompose(row.body, effectiveBodyFormat);
   if (t === "Send Email") {
     return {
       ok: true,
@@ -752,8 +811,8 @@ function mapActionToEnvelope({ row, externalEventId, accountId, identityId, requ
           cc: Array.isArray(migratedPayload?.cc) ? migratedPayload.cc : [],
           bcc: Array.isArray(migratedPayload?.bcc) ? migratedPayload.bcc : [],
           subject: row.subject,
-          body: row.body,
-          bodyFormat: migratedPayload?.bodyFormat === "html" ? "html" : "plain",
+          body: bodyResolved.body,
+          bodyFormat: bodyResolved.bodyFormat,
           sendMode: migratedPayload?.sendMode || "sendNow",
         },
         idempotency_key: externalEventId,
@@ -771,8 +830,8 @@ function mapActionToEnvelope({ row, externalEventId, accountId, identityId, requ
           identityId,
           messageId: replyMessageId ?? migratedPayload?.messageId,
           replyType: migratedPayload?.replyType || "replyToSender",
-          body: row.body,
-          bodyFormat: migratedPayload?.bodyFormat === "html" ? "html" : "plain",
+          body: bodyResolved.body,
+          bodyFormat: bodyResolved.bodyFormat,
           sendMode: migratedPayload?.sendMode || "sendNow",
         },
         idempotency_key: externalEventId,

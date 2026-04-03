@@ -60,6 +60,54 @@ function readRichText(prop) {
   return "";
 }
 
+function escapeHtml(text) {
+  return String(text || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function sanitizeHttpHref(url) {
+  const u = String(url || "").trim();
+  return /^https?:\/\//i.test(u) ? u : "";
+}
+
+/**
+ * Notion stores hyperlinks in rich_text runs as text.link.url, not in plain_text.
+ * concatPlainText() alone loses links; this preserves them as HTML for compose (html body).
+ */
+function richTextPropertyToHtml(prop) {
+  if (prop?.type !== "rich_text" || !Array.isArray(prop.rich_text)) return "";
+  let out = "";
+  for (const rt of prop.rich_text) {
+    const content = rt?.plain_text ?? "";
+    const url = sanitizeHttpHref(rt?.text?.link?.url ?? rt?.href ?? "");
+    let fragment = escapeHtml(content).replace(/\n/g, "<br>");
+    if (url) {
+      fragment = `<a href="${escapeHtml(url)}">${fragment}</a>`;
+    }
+    if (rt?.annotations?.code) {
+      fragment = `<code>${fragment}</code>`;
+    }
+    if (rt?.annotations?.bold) {
+      fragment = `<strong>${fragment}</strong>`;
+    }
+    if (rt?.annotations?.italic) {
+      fragment = `<em>${fragment}</em>`;
+    }
+    if (rt?.annotations?.strikethrough) {
+      fragment = `<s>${fragment}</s>`;
+    }
+    if (rt?.annotations?.underline) {
+      fragment = `<u>${fragment}</u>`;
+    }
+    out += fragment;
+  }
+  return out;
+}
+
 function readPropertyText(props, keys) {
   const prop = firstDefined(props, keys);
   return readRichText(prop);
@@ -165,7 +213,7 @@ function parseQueueRow(page) {
     "Subject",
     "subject",
   ]);
-  const bodyCol = readPropertyText(props, [
+  const bodyProp = firstDefined(props, [
     "Outreach Body",
     "outreach_body",
     "outreachBody",
@@ -173,7 +221,16 @@ function parseQueueRow(page) {
     "body",
   ]);
   const subject = firstNonEmpty(subjectCol, payload?.subject);
-  const body = firstNonEmpty(bodyCol, payload?.body);
+
+  let body = "";
+  /** When set to "html", body was built from Notion rich_text (includes <a> for links). */
+  let bodySourceFormat = undefined;
+  if (bodyProp?.type === "rich_text") {
+    body = richTextPropertyToHtml(bodyProp);
+    bodySourceFormat = "html";
+  } else {
+    body = firstNonEmpty(readRichText(bodyProp), payload?.body);
+  }
   const keyPersonPageId = readRelationFirstId(firstDefined(props, ["KeyPerson ID", "key_person_id", "keyPersonId"]));
 
   const taskIdProp = firstDefined(props, ["Task ID", "task_id", "taskId"]);
@@ -208,6 +265,7 @@ function parseQueueRow(page) {
     fromEmail: actorEmail,
     subject,
     body,
+    bodySourceFormat,
     replyToHeaderMessageId: payload?.headerMessageId || payload?.replyToHeaderMessageId || "",
     taskId,
     dependsOnTaskId,
@@ -228,5 +286,6 @@ module.exports = {
   computeExternalEventId,
   readSelectName,
   readEmailValue,
+  richTextPropertyToHtml,
 };
 

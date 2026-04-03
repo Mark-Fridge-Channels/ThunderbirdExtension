@@ -10,6 +10,8 @@
 - [x] 🟩 **依赖**：`depends_on_task_id` 存依赖页 `page.id`，`getPage` + 读 outreach 状态列。
 - [x] 🟩 **入站回信**：`Reply Body` 列写入 `findMessages` body；`Payload` 仅线程元数据（无 `body`）；入站行同时写 `Outreach Subject` / `Outreach Body`（可配置）。
 - [x] 🟩 **Notion 客户端**：新增 `getPage`。
+- [x] 🟩 **链接发送体验**：Notion `Outreach Body`（rich_text）中带 `text.link.url` 的片段在 `queueParser` 中转为 HTML；Markdown `[text](url)` 在 `executor` 中作补充；`Payload.bodyFormat` 仍可覆盖。
+- [x] 🟩 **调试脚本**：`node minimal-server/inspect_outreach_body.js <notion_url>` 打印 `Outreach Body` 原始 JSON 与链接摘要。
 
 ## TLDR
 
