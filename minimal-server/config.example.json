@@ -2,17 +2,21 @@
   "notion": {
     "token": "secret_xxx_or_ntn_xxx",
     "database_id": "00000000-0000-0000-0000-000000000000",
-    "notion_version": "2022-06-28"
+    "notion_version": "2022-06-28",
+    "key_person_database_id": ""
   },
   "executor": {
     "enabled": true,
     "poll_interval_ms": 60000,
     "page_size": 20,
     "notion_property_names": {
-      "Status": "Status",
+      "Status": "OutReach Status",
+      "subject": "Outreach Subject",
+      "body": "Outreach Body",
       "executed_at": "Completion Time",
       "execution_result_detail": "Result Remark",
       "reply_status": "Reply Status",
+      "reply": "Reply Body",
       "payload": "Payload"
     }
   }

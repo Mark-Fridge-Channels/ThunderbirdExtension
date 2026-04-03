@@ -5,17 +5,21 @@
  * - Single-thread, sequential execution (one row at a time).
  * - Notion read is one page (page_size from config), then filtered in-memory.
  * - Eligibility filter follows InteractionLOG spec:
- *   Platform=Email, InNOut=Out, Status=Todo, Action in (Send Email, Reply Email),
+ *   Platform=Email, InNOut=Out, OutReach Status=Todo, Action in (Send Email, Reply Email);
+ *   subject/body columns: Outreach Subject / Outreach Body (configurable via notion_property_names).
  *   FCAccount must exist on current Thunderbird identity list, and time is inside execution window.
  * - "Already executed" is decided by the presence of `external_event_id` on the row.
  */
 
-const { queryDatabase, updatePage, createPage } = require("./notion.js");
-const { parseQueueRow, isWithinWindow, computeExternalEventId } = require("./queueParser.js");
+const { queryDatabase, updatePage, createPage, getPage } = require("./notion.js");
+const { parseQueueRow, isWithinWindow, computeExternalEventId, readSelectName, readEmailValue } = require("./queueParser.js");
 
 /** Cache listAccounts to avoid hammering the extension (same process, short TTL). */
 let accountsCache = { at: 0, data: null };
 const ACCOUNTS_CACHE_MS = 60000;
+
+/** KeyPerson page id -> normalized email (process lifetime). */
+const keyPersonEmailCache = new Map();
 
 function nowIso() {
   return new Date().toISOString();
@@ -175,20 +179,42 @@ async function findReplyTargetMessageId(enqueueAndWait, requestIdPrefix, account
   return res.result.items[0].messageId ?? null;
 }
 
-async function queryDependencyStatus(notionCfg, databaseId, dependsOnTaskId) {
-  // Spec: filter by property `Task ID` rich_text equals depends_on_task_id; page_size=1.
-  const filter = {
-    property: "Task ID",
-    rich_text: { equals: dependsOnTaskId },
-  };
-  const data = await queryDatabase(notionCfg, databaseId, { pageSize: 1, filter });
-  const page = Array.isArray(data?.results) && data.results.length ? data.results[0] : null;
-  if (!page) return { found: false, status: null };
-  const row = parseQueueRow(page);
-  return { found: true, status: row.status || null };
+/**
+ * Dependency: `depends_on_task_id` stores the dependent page id (same as Notion page id / Task ID formula output).
+ * Uses GET /pages/{id} and reads the configured outreach status column (e.g. OutReach Status).
+ */
+async function getDependencyOutreachStatus(notionCfg, dependsOnPageId, outreachStatusColumn) {
+  const id = String(dependsOnPageId || "").trim();
+  if (!id) return { found: false, status: null };
+  const col = outreachStatusColumn || "OutReach Status";
+  try {
+    const page = await getPage(notionCfg, id);
+    const st = readSelectName(page?.properties?.[col]);
+    return { found: true, status: st || null };
+  } catch (e) {
+    console.error("[executor] dependency getPage failed", { dependsOnPageId: id, error: e?.message ?? e });
+    return { found: false, status: null };
+  }
 }
 
-function validateRequired(row) {
+async function resolveKeyPersonEmail(notionCfg, row) {
+  if (!row.keyPersonPageId) return normalizeEmail(row.counterpartyEmail);
+  const key = row.keyPersonPageId;
+  if (keyPersonEmailCache.has(key)) return keyPersonEmailCache.get(key);
+  try {
+    const page = await getPage(notionCfg, key);
+    const raw = readEmailValue(page?.properties?.Email);
+    const em = normalizeEmail(raw);
+    keyPersonEmailCache.set(key, em);
+    return em;
+  } catch (e) {
+    console.error("[executor] KeyPerson Email fetch failed", { keyPersonPageId: key, error: e?.message ?? e });
+    keyPersonEmailCache.set(key, "");
+    return "";
+  }
+}
+
+function validateRequired(row, partnerEmailResolved) {
   const t = (row.actionText || "").trim();
   if (!t) return { ok: false, reason: "unsupported_action" };
 
@@ -197,12 +223,16 @@ function validateRequired(row) {
     return { ok: false, reason: "v1_queue_unsupported" };
   }
 
-  if (!row.payload) return { ok: false, reason: "invalid_payload_json" };
+  const payloadBroken =
+    typeof row.payloadText === "string" && row.payloadText.trim() && row.payload == null;
+  if (payloadBroken) return { ok: false, reason: "invalid_payload_json" };
+
   if (!row.fcAccount) return { ok: false, reason: "missing_fcaccount" };
   if (t === "Send Email") {
     if (!row.subject) return { ok: false, reason: "missing_subject" };
     if (!row.body) return { ok: false, reason: "missing_body" };
-    if (!row.counterpartyEmail) return { ok: false, reason: "missing_counterparty_mailbox_id" };
+    const to = normalizeEmail(partnerEmailResolved ?? row.counterpartyEmail);
+    if (!to) return { ok: false, reason: "missing_counterparty_mailbox_id" };
   }
   if (t === "Reply Email") {
     if (!row.body) return { ok: false, reason: "missing_body" };
@@ -243,27 +273,25 @@ function firstNonEmptyString(...values) {
   return "";
 }
 
-function buildMinimalPayload({ row, resultPayload, mode }) {
+function buildMinimalPayload({ row, resultPayload, mode, partnerEmail }) {
   const resultHeaderMessageId = firstNonEmptyString(
     resultPayload?.headerMessageId,
     resultPayload?.sentHeaderMessageId
   );
   const toEmail = normalizeEmail(
-    firstNonEmptyString(row?.payload?.to_email) ||
-    (Array.isArray(row?.payload?.to) ? firstNonEmptyString(row.payload.to[0]) : "") ||
-    firstNonEmptyString(row?.counterpartyEmail)
+    firstNonEmptyString(partnerEmail, row?.counterpartyEmail, row?.payload?.to_email) ||
+      (Array.isArray(row?.payload?.to) ? firstNonEmptyString(row.payload.to[0]) : "")
   );
-  const fromEmail = normalizeEmail(firstNonEmptyString(row?.payload?.from_email, row?.fcAccount));
-  const baseSubject = firstNonEmptyString(row?.payload?.subject, row?.subject);
-  const baseBody = firstNonEmptyString(row?.payload?.body, row?.body);
+  const fromEmail = normalizeEmail(firstNonEmptyString(row?.fcAccount, row?.payload?.from_email));
+  const baseSubject = firstNonEmptyString(row?.subject, row?.payload?.subject);
+  const baseBody = firstNonEmptyString(row?.body, row?.payload?.body);
   const conversationAnchor = firstNonEmptyString(row?.payload?.conversationAnchor, row?.payload?.headerMessageId, resultHeaderMessageId);
 
-  // Unified minimal payload for Send Email / Reply Email / Inbound Reply chains.
+  // Thread metadata only (no duplicate body); InteractionLOG uses Outreach Subject / Outreach Body columns as source of truth.
   const out = {
     to_email: toEmail,
     from_email: fromEmail,
     subject: baseSubject,
-    body: baseBody,
     headerMessageId: resultHeaderMessageId,
     conversationAnchor,
     sourceOutPageId: row?.pageId || "",
@@ -331,7 +359,7 @@ function buildInboundCreateProperties(sourceRow, inboundMsg, propNames) {
     ["InNOut", "In"],
     ["Action", "Inbound Reply"],
     [p.Status || "Status", "Success"],
-    [p.reply_status || "Reply Status", "Done"],
+    [p.reply_status || "Reply Status", "Todo"],
     [p.executed_at || "Completion Time", new Date(inboundMsg.date || Date.now())],
     [p.execution_result_detail || "Result Remark", inboundMsg.snippet || inboundMsg.subject || "Inbound reply captured"],
     [p.payload || "Payload", JSON.stringify(inboundMsg.payload || {})],
@@ -350,6 +378,28 @@ function buildInboundCreateProperties(sourceRow, inboundMsg, propNames) {
     const type = getPropertyType(srcPage, name);
     if (!type) continue;
     props[name] = notionFromValueByType(type, value);
+  }
+
+  const replyCol = p.reply || "Reply Body";
+  const replyType = getPropertyType(srcPage, replyCol);
+  if (replyType && inboundMsg.replyText != null) {
+    props[replyCol] = notionFromValueByType(replyType, inboundMsg.replyText);
+  }
+
+  const subjectCol = p.subject || "Outreach Subject";
+  const bodyCol = p.body || "Outreach Body";
+  for (const [col, val] of [
+    [subjectCol, inboundMsg.subject || ""],
+    [bodyCol, ""],
+  ]) {
+    const typ = getPropertyType(srcPage, col);
+    if (typ) props[col] = notionFromValueByType(typ, val);
+  }
+
+  const kpSrc = sourceRow?.raw?.properties?.["KeyPerson ID"];
+  if (kpSrc?.type === "relation" && Array.isArray(kpSrc.relation) && kpSrc.relation.length) {
+    const kt = getPropertyType(srcPage, "KeyPerson ID");
+    if (kt === "relation") props["KeyPerson ID"] = { relation: kpSrc.relation.map((x) => ({ id: x.id })).filter((x) => x.id) };
   }
 
   // Extra fields required by InteractionLOG inbound spec.
@@ -390,7 +440,7 @@ async function runInboundWatchOnce({ cfg, enqueueAndWait }) {
     databaseId,
     pageSize: Math.max(100, cfg.executor.pageSize),
     sorts: [{ property: "Completion Time", direction: "descending" }],
-    where: "Platform=Email AND InNOut=Out AND Status=Success AND Action in (Send Email, Reply Email) AND Reply Status not in (Done, NO)",
+    where: "Platform=Email AND InNOut=Out AND OutReach Status=Success AND Action in (Send Email, Reply Email) AND Reply Status not in (Done, NO)",
   });
   const data = await queryDatabase(notionCfg, databaseId, {
     pageSize: Math.max(100, cfg.executor.pageSize),
@@ -425,7 +475,7 @@ async function runInboundWatchOnce({ cfg, enqueueAndWait }) {
     const inboxFolderId = findSpecialFolder(accountObj?.rootFolder, "inbox");
     if (!inboxFolderId) continue;
 
-    const partnerEmail = extractEmail(row.payload?.to_email || row.counterpartyEmail);
+    const partnerEmail = extractEmail(await resolveKeyPersonEmail(notionCfg, row) || row.counterpartyEmail);
     const fromDate = row.completionTime instanceof Date ? row.completionTime : new Date(Date.now() - 60 * 60 * 1000);
     const findRes = await enqueueAndWait({
       request_id: `inbound-find-${row.taskId}-${Date.now()}`,
@@ -471,16 +521,25 @@ async function runInboundWatchOnce({ cfg, enqueueAndWait }) {
     });
     if (!target) continue;
 
-    const inboundPayload = {
-      to_email: row.fcAccount,
-      from_email: extractEmail(target.author),
-      subject: target.subject || row.subject,
-      body: target.body || "",
+    const metadataPayload = {
       headerMessageId: target.headerMessageId || "",
       conversationAnchor: row.payload?.conversationAnchor || row.payload?.headerMessageId || target.headerMessageId || "",
       sourceOutPageId: row.pageId,
+      messageId: target.messageId,
+      to_email: row.fcAccount,
+      from_email: extractEmail(target.author),
+      subject: target.subject || row.subject,
     };
-    const createProps = buildInboundCreateProperties(row, { ...target, payload: inboundPayload }, cfg.executor?.notionPropertyNames);
+    const createProps = buildInboundCreateProperties(
+      row,
+      {
+        ...target,
+        subject: target.subject || row.subject,
+        replyText: target.body || "",
+        payload: metadataPayload,
+      },
+      cfg.executor?.notionPropertyNames
+    );
     if (Object.keys(createProps).length === 0) continue;
     await createPage(notionCfg, databaseId, createProps);
     await markReplyDone(cfg, row, `inbound_reply_detected:${target.headerMessageId || target.messageId}`);
@@ -494,15 +553,16 @@ async function runInboundWatchOnce({ cfg, enqueueAndWait }) {
 }
 
 async function executeOne({ cfg, enqueueAndWait }, row) {
-  const databaseId = cfg.notion.databaseId;
   const notionCfg = { token: cfg.notion.token, notionVersion: cfg.notion.notionVersion };
   const externalEventId = computeExternalEventId(row.taskId, row.actionText || "unknown");
 
   // Idempotency is controlled by Task ID + Status workflow (Todo -> Progress -> Success/Failed).
 
   // 4.2 dependency check
+  const outreachStatusCol = cfg.executor?.notionPropertyNames?.Status || "OutReach Status";
+
   if (row.dependsOnTaskId) {
-    const dep = await queryDependencyStatus(notionCfg, databaseId, row.dependsOnTaskId);
+    const dep = await getDependencyOutreachStatus(notionCfg, row.dependsOnTaskId, outreachStatusCol);
     if (!dep.found) {
       return await failWriteback({
         cfg,
@@ -535,8 +595,10 @@ async function executeOne({ cfg, enqueueAndWait }, row) {
     }
   }
 
+  const resolvedPartnerEmail = await resolveKeyPersonEmail(notionCfg, row);
+
   // 4.4 required fields
-  const req = validateRequired(row);
+  const req = validateRequired(row, resolvedPartnerEmail);
   if (!req.ok) {
     const detail =
       req.reason === "v1_queue_unsupported"
@@ -599,8 +661,8 @@ async function executeOne({ cfg, enqueueAndWait }, row) {
           externalEventId,
         });
       }
-    } else if (Number.isFinite(Number(migratedPayload?.messageId ?? row.payload?.messageId))) {
-      replyMessageId = Number(migratedPayload?.messageId ?? row.payload?.messageId);
+    } else if (Number.isFinite(Number(migrated.payload?.messageId ?? row.payload?.messageId))) {
+      replyMessageId = Number(migrated.payload?.messageId ?? row.payload?.messageId);
     } else {
       return await failWriteback({
         cfg,
@@ -635,6 +697,7 @@ async function executeOne({ cfg, enqueueAndWait }, row) {
     requestId: rid,
     replyMessageId,
     migratedPayload: migrated.payload,
+    partnerEmail: resolvedPartnerEmail,
   });
   if (!mapped.ok) {
     return await failWriteback({ cfg, row, reason: mapped.reason, detail: mapped.reason, externalEventId });
@@ -662,6 +725,7 @@ async function executeOne({ cfg, enqueueAndWait }, row) {
     row,
     resultPayload: out?.result || {},
     mode: row?.actionText === "Reply Email" ? "reply_outbound" : "send_outbound",
+    partnerEmail: resolvedPartnerEmail,
   });
   return await successWriteback({
     cfg,
@@ -672,8 +736,9 @@ async function executeOne({ cfg, enqueueAndWait }, row) {
   });
 }
 
-function mapActionToEnvelope({ row, externalEventId, accountId, identityId, requestId, replyMessageId, migratedPayload }) {
+function mapActionToEnvelope({ row, externalEventId, accountId, identityId, requestId, replyMessageId, migratedPayload, partnerEmail }) {
   const t = row.actionText;
+  const toMailbox = normalizeEmail(partnerEmail || row.counterpartyEmail);
   if (t === "Send Email") {
     return {
       ok: true,
@@ -683,7 +748,7 @@ function mapActionToEnvelope({ row, externalEventId, accountId, identityId, requ
         payload: {
           accountId,
           identityId,
-          to: Array.isArray(migratedPayload?.to) ? migratedPayload.to : [row.counterpartyEmail],
+          to: Array.isArray(migratedPayload?.to) ? migratedPayload.to : [toMailbox],
           cc: Array.isArray(migratedPayload?.cc) ? migratedPayload.cc : [],
           bcc: Array.isArray(migratedPayload?.bcc) ? migratedPayload.bcc : [],
           subject: row.subject,
@@ -770,7 +835,7 @@ async function runOnce({ cfg, enqueueAndWait }) {
     databaseId,
     pageSize: cfg.executor.pageSize,
     sorts: [{ property: "Trigger Time", direction: "ascending" }],
-    where: "Platform=Email AND InNOut=Out AND Status=Todo AND Action in (Send Email, Reply Email) AND FCAccount in local identities AND now in execute window",
+    where: "Platform=Email AND InNOut=Out AND OutReach Status=Todo AND Action in (Send Email, Reply Email) AND FCAccount in local identities AND now in execute window",
   });
 
   const data = await queryDatabase(notionCfg, databaseId, {
@@ -846,7 +911,9 @@ async function runOnce({ cfg, enqueueAndWait }) {
       }
       continue;
     }
-    if (!row.payload) {
+    const payloadBroken =
+      typeof row.payloadText === "string" && row.payloadText.trim() && row.payload == null;
+    if (payloadBroken) {
       rejectStats.payloadInvalid += 1;
       if (isSendTodo) {
         sendEmailTodoRejectStats.payloadInvalid += 1;

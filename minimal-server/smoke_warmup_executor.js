@@ -22,7 +22,7 @@ async function main() {
   const notionCfg = { token: cfg.notion.token, notionVersion: cfg.notion.notionVersion };
   const data = await queryDatabase(notionCfg, cfg.notion.databaseId, {
     pageSize: cfg.executor.pageSize,
-    sorts: [{ property: "Execute Window", direction: "ascending" }],
+    sorts: [{ property: "Trigger Time", direction: "ascending" }],
   });
 
   const results = Array.isArray(data?.results) ? data.results : [];
@@ -30,9 +30,10 @@ async function main() {
   const candidates = [];
   for (const page of results) {
     const row = parseQueueRow(page);
-    if (!row.plannedEventType) continue;
-    if (row.status !== "Pending") continue;
-    if (row.auditDecision !== "Keep") continue;
+    if (row.platform !== "Email") continue;
+    if (row.inNOut !== "Out") continue;
+    if (row.status !== "Todo") continue;
+    if (row.actionText !== "Send Email" && row.actionText !== "Reply Email") continue;
     if (!isWithinWindow(row.executeWindow, now)) continue;
     candidates.push(row);
   }
@@ -40,7 +41,12 @@ async function main() {
   console.log("queried rows:", results.length);
   console.log("candidates:", candidates.length);
   for (const r of candidates.slice(0, 5)) {
-    console.log("-", { taskId: r.taskId, type: r.plannedEventType, actor: r.actorEmail, target: r.counterpartyEmail });
+    console.log("-", {
+      taskId: r.taskId,
+      action: r.actionText,
+      actor: r.fcAccount,
+      keyPersonPageId: r.keyPersonPageId,
+    });
   }
 }
 

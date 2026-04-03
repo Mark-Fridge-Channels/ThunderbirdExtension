@@ -3,6 +3,7 @@
  *
  * We only implement what's needed for Warmup Executor:
  * - POST /v1/databases/{database_id}/query
+ * - GET /v1/pages/{page_id}
  * - PATCH /v1/pages/{page_id}
  * - POST /v1/pages
  *
@@ -55,6 +56,16 @@ async function queryDatabase(cfg, databaseId, { pageSize = 20, sorts = [], filte
   return await notionFetch(cfg, "POST", `/databases/${databaseId}/query`, body);
 }
 
+async function getPage(cfg, pageId) {
+  const id = String(pageId || "").replace(/-/g, "");
+  if (!id) throw new Error("getPage: pageId required");
+  const hyphenated =
+    id.length === 32
+      ? `${id.slice(0, 8)}-${id.slice(8, 12)}-${id.slice(12, 16)}-${id.slice(16, 20)}-${id.slice(20)}`
+      : String(pageId);
+  return await notionFetch(cfg, "GET", `/pages/${hyphenated}`);
+}
+
 async function updatePage(cfg, pageId, properties) {
   return await notionFetch(cfg, "PATCH", `/pages/${pageId}`, { properties });
 }
@@ -66,5 +77,5 @@ async function createPage(cfg, databaseId, properties) {
   });
 }
 
-module.exports = { queryDatabase, updatePage, createPage };
+module.exports = { queryDatabase, getPage, updatePage, createPage };
 

@@ -54,9 +54,12 @@ function loadConfig() {
 
   const defaultPropNames = {
     Status: "Status",
+    subject: "Outreach Subject",
+    body: "Outreach Body",
     executed_at: "Completion Time",
     execution_result_detail: "Result Remark",
     reply_status: "Reply Status",
+    reply: "Reply Body",
     payload: "Payload",
     external_event_id: "",
   };
@@ -70,6 +73,10 @@ function loadConfig() {
       token: requireNonEmptyString(notion.token, "notion.token"),
       databaseId: requireNonEmptyString(notion.database_id, "notion.database_id"),
       notionVersion: (typeof notion.notion_version === "string" && notion.notion_version.trim()) || "2022-06-28",
+      keyPersonDatabaseId:
+        typeof notion.key_person_database_id === "string" && notion.key_person_database_id.trim()
+          ? notion.key_person_database_id.trim()
+          : "",
     },
     executor: {
       enabled: asBoolean(process.env.EXECUTOR_ENABLED ?? executor.enabled, true),
@@ -87,6 +94,7 @@ function printConfigSummary(cfg) {
   const masked = cfg.notion.token.slice(0, 6) + "…" + cfg.notion.token.slice(-4);
   console.error("[minimal-server] config loaded from", cfg.configPath);
   console.error("  notion.database_id =", cfg.notion.databaseId);
+  console.error("  notion.key_person_database_id =", cfg.notion.keyPersonDatabaseId || "(empty)");
   console.error("  notion.token =", masked);
   console.error("  notion.version =", cfg.notion.notionVersion);
   console.error("  executor.enabled =", cfg.executor.enabled);

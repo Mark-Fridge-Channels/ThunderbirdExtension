@@ -24,6 +24,29 @@ function readSelectName(prop) {
   return "";
 }
 
+/** Notion `formula` property: string / number / boolean / date variants — we only need display text for Task ID-style formulas. */
+function readFormulaAsText(prop) {
+  if (prop?.type !== "formula" || !prop.formula) return "";
+  const f = prop.formula;
+  if (f.type === "string") return String(f.string ?? "").trim();
+  if (f.type === "number" && f.number != null) return String(f.number).trim();
+  if (f.type === "boolean") return f.boolean ? "true" : "false";
+  if (f.type === "date" && f.date?.start) return String(f.date.start).trim();
+  return "";
+}
+
+function readRelationFirstId(prop) {
+  if (prop?.type !== "relation" || !Array.isArray(prop.relation)) return "";
+  const first = prop.relation[0];
+  const id = first?.id;
+  return id ? String(id).trim() : "";
+}
+
+function readEmailValue(prop) {
+  if (prop?.type === "email" && prop.email) return String(prop.email).trim();
+  return "";
+}
+
 function readDateRange(prop) {
   if (prop?.type !== "date") return { start: null, end: null };
   const start = prop?.date?.start ? new Date(prop.date.start) : null;
@@ -115,8 +138,14 @@ function computeExternalEventId(taskId, plannedEventType) {
 function parseQueueRow(page) {
   const props = page?.properties ?? {};
 
-  const actionText = readPropertyText(props, ["Action", "action"]);
-  const status = readPropertySelect(props, ["Status", "status"]);
+  const actionText = readPropertySelect(props, ["Action", "action"]) || readPropertyText(props, ["Action", "action"]);
+  const status = readPropertySelect(props, [
+    "OutReach Status",
+    "out_reach_status",
+    "outReachStatus",
+    "Status",
+    "status",
+  ]);
   const replyStatus = readPropertySelect(props, ["Reply Status", "reply_status", "replyStatus"]);
   const platform = readPropertySelect(props, ["Platform", "platform"]);
   const inNOut = readPropertySelect(props, ["InNOut", "in_n_out", "inNOut"]);
@@ -129,14 +158,34 @@ function parseQueueRow(page) {
 
   const plannedEventType = normalizePlannedEventType(actionText);
   const actorEmail = fcAccount;
-  const counterpartyEmail = payload?.to_email || payload?.to || "";
-  const fromEmail = normalizeEmail(payload?.from_email || actorEmail || "");
-  const subject = payload?.subject || "";
-  const body = payload?.body || "";
-  const replyToHeaderMessageId = payload?.headerMessageId || payload?.replyToHeaderMessageId || "";
-  const taskId = readPropertyText(props, ["Task ID", "task_id", "taskId"]) || String(page?.id || "");
+  const subjectCol = readPropertyText(props, [
+    "Outreach Subject",
+    "outreach_subject",
+    "outreachSubject",
+    "Subject",
+    "subject",
+  ]);
+  const bodyCol = readPropertyText(props, [
+    "Outreach Body",
+    "outreach_body",
+    "outreachBody",
+    "Body",
+    "body",
+  ]);
+  const subject = firstNonEmpty(subjectCol, payload?.subject);
+  const body = firstNonEmpty(bodyCol, payload?.body);
+  const keyPersonPageId = readRelationFirstId(firstDefined(props, ["KeyPerson ID", "key_person_id", "keyPersonId"]));
+
+  const taskIdProp = firstDefined(props, ["Task ID", "task_id", "taskId"]);
+  let taskIdFromCol = "";
+  if (taskIdProp?.type === "formula") taskIdFromCol = readFormulaAsText(taskIdProp);
+  else if (taskIdProp) taskIdFromCol = readRichText(taskIdProp);
+  const taskId = firstNonEmpty(taskIdFromCol, String(page?.id || ""));
+
   const dependsOnTaskId = readPropertyText(props, ["depends_on_task_id", "dependsOnTaskId"]);
   const externalEventId = readPropertyText(props, ["external_event_id", "External Event Id", "External Event ID"]);
+
+  const counterpartyEmail = normalizeEmail(payload?.to_email || payload?.to || "");
 
   return {
     pageId: page?.id,
@@ -155,19 +204,29 @@ function parseQueueRow(page) {
     payloadParseError: payloadJson.error,
     actorEmail,
     counterpartyEmail,
-    fromEmail: fromEmail || counterpartyEmail,
+    keyPersonPageId,
+    fromEmail: actorEmail,
     subject,
     body,
-    replyToHeaderMessageId,
+    replyToHeaderMessageId: payload?.headerMessageId || payload?.replyToHeaderMessageId || "",
     taskId,
     dependsOnTaskId,
     externalEventId,
   };
 }
 
+function firstNonEmpty(...vals) {
+  for (const v of vals) {
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return "";
+}
+
 module.exports = {
   parseQueueRow,
   isWithinWindow,
   computeExternalEventId,
+  readSelectName,
+  readEmailValue,
 };
 

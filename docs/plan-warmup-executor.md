@@ -2,6 +2,15 @@
 
 **Overall Progress:** `100%`
 
+## InteractionLOG schema alignment（2026-04）
+
+- [x] 🟩 **OutReach Status**：通过 `executor.notion_property_names.Status` 映射写回；解析支持 `OutReach Status` / `Status` 别名。
+- [x] 🟩 **Outreach Subject / Outreach Body / Action(Select)**：`parseQueueRow` 从列读取（兼容旧列名 Subject/Body）；Action 支持 Select + 旧 title/rich_text。
+- [x] 🟩 **收信人**：`KeyPerson ID` relation → `GET /pages/{id}` 读 `Email`（Notion `email` 类型）；可选配置 `notion.key_person_database_id`（预留）。
+- [x] 🟩 **依赖**：`depends_on_task_id` 存依赖页 `page.id`，`getPage` + 读 outreach 状态列。
+- [x] 🟩 **入站回信**：`Reply Body` 列写入 `findMessages` body；`Payload` 仅线程元数据（无 `body`）；入站行同时写 `Outreach Subject` / `Outreach Body`（可配置）。
+- [x] 🟩 **Notion 客户端**：新增 `getPage`。
+
 ## TLDR
 
 在本项目的 `minimal-server` 内实现 Warmup Executor：每 60s 轮询 Notion Queue（database_id），筛选窗口内的 Pending+Keep 任务，按队列串行调用扩展 action（Send/Open/Reply/Star/Add Contact）并拿到执行结果后回写 Notion（Status/executed_at/execution_result_detail/external_event_id），从而移除「外部程序读队列→HTTP 调用→再回写」的链路。
