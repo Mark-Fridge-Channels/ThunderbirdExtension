@@ -16,7 +16,6 @@ const { parseQueueRow, isWithinWindow, computeExternalEventId, readSelectName, r
 
 /** Cache listAccounts to avoid hammering the extension (same process, short TTL). */
 let accountsCache = { at: 0, data: null };
-const ACCOUNTS_CACHE_MS = 60000;
 
 /** KeyPerson page id -> normalized email (process lifetime). */
 const keyPersonEmailCache = new Map();
@@ -109,9 +108,16 @@ function makeDetail({ ok, reason, action, requestId, extensionResult, extensionE
   return JSON.stringify(payload, null, 2);
 }
 
-async function getAccountsPayload(enqueueAndWait, requestIdPrefix) {
+function getAccountsCacheMs(cfg) {
+  const ms = Number(cfg?.executor?.accountsCacheMs);
+  if (!Number.isFinite(ms) || ms < 60 * 1000) return 6 * 60 * 60 * 1000;
+  return ms;
+}
+
+async function getAccountsPayload(cfg, enqueueAndWait, requestIdPrefix) {
   const now = Date.now();
-  if (accountsCache.data && now - accountsCache.at < ACCOUNTS_CACHE_MS) {
+  const cacheMs = getAccountsCacheMs(cfg);
+  if (accountsCache.data && now - accountsCache.at < cacheMs) {
     return accountsCache.data;
   }
   const listRes = await enqueueAndWait({
@@ -387,6 +393,82 @@ async function queryInboundPages(notionCfg, databaseId, pageSize) {
   return await queryDatabase(notionCfg, databaseId, { pageSize, filter });
 }
 
+async function queryOutboundCandidatePages({ notionCfg, databaseId, pageSize, maxScanRows, lowerBound, upperBound }) {
+  const sorts = [{ property: "Trigger Time", direction: "ascending" }];
+  const baseClauses = [
+    { property: "Platform", select: { equals: "Email" } },
+    { property: "InNOut", select: { equals: "Out" } },
+    {
+      or: [
+        { property: "Action", select: { equals: "Send Email" } },
+        { property: "Action", select: { equals: "Reply Email" } },
+      ],
+    },
+    { property: "Trigger Time", date: { on_or_after: lowerBound.toISOString() } },
+    { property: "Trigger Time", date: { on_or_before: upperBound.toISOString() } },
+  ];
+  const filterPlans = [
+    {
+      name: "status_filter=status",
+      filter: { and: [...baseClauses, { property: "OutReach Status", status: { equals: "Todo" } }] },
+    },
+    {
+      name: "status_filter=select",
+      filter: { and: [...baseClauses, { property: "OutReach Status", select: { equals: "Todo" } }] },
+    },
+    {
+      name: "status_filter=none",
+      filter: { and: baseClauses },
+    },
+    {
+      name: "status_filter=none,action_filter=none",
+      filter: {
+        and: [
+          { property: "Platform", select: { equals: "Email" } },
+          { property: "InNOut", select: { equals: "Out" } },
+          { property: "Trigger Time", date: { on_or_after: lowerBound.toISOString() } },
+          { property: "Trigger Time", date: { on_or_before: upperBound.toISOString() } },
+        ],
+      },
+    },
+  ];
+
+  let lastError = null;
+  for (const plan of filterPlans) {
+    try {
+      const out = [];
+      let cursor = undefined;
+      let hasMore = false;
+      while (out.length < maxScanRows) {
+        const data = await queryDatabase(notionCfg, databaseId, {
+          pageSize,
+          sorts,
+          filter: plan.filter,
+          startCursor: cursor,
+        });
+        const chunk = Array.isArray(data?.results) ? data.results : [];
+        out.push(...chunk);
+        hasMore = Boolean(data?.has_more);
+        if (!data?.has_more || !data?.next_cursor || chunk.length === 0) break;
+        cursor = data.next_cursor;
+      }
+      const items = out.slice(0, maxScanRows);
+      return {
+        items,
+        truncated: items.length >= maxScanRows && hasMore,
+        filterPlan: plan.name,
+      };
+    } catch (e) {
+      lastError = e;
+      console.error("[executor][outbound] notion filter plan failed", {
+        filterPlan: plan.name,
+        error: e?.message ?? e,
+      });
+    }
+  }
+  throw lastError || new Error("outbound_query_all_filter_plans_failed");
+}
+
 function collectInboundHeaderIds(pages) {
   const ids = new Set();
   for (const page of pages || []) {
@@ -522,10 +604,28 @@ async function runInboundWatchOnce({ cfg, enqueueAndWait }) {
   const inboundData = await queryInboundPages(notionCfg, databaseId, 100);
   const inboundPages = Array.isArray(inboundData?.results) ? inboundData.results : [];
   const existingInboundHeaderIds = collectInboundHeaderIds(inboundPages);
-  const accountsPayload = await getAccountsPayload(enqueueAndWait, `inbound-${Date.now()}`);
-  console.error("[executor][inbound] scanning", { outboundCandidates: candidates.length, existingInbound: existingInboundHeaderIds.size });
+  const accountsPayload = await getAccountsPayload(cfg, enqueueAndWait, `inbound-${Date.now()}`);
+  const allowedSenders = listAllowedSenderEmails(accountsPayload);
+  const localCandidates = candidates.filter((r) => r.fcAccount && allowedSenders.has(r.fcAccount));
+  console.error("[executor][inbound] scanning", {
+    outboundCandidates: candidates.length,
+    localOutboundCandidates: localCandidates.length,
+    skippedByFcAccountNotLocal: candidates.length - localCandidates.length,
+    existingInbound: existingInboundHeaderIds.size,
+  });
 
-  for (const row of candidates) {
+  const inboundCap = Math.max(1, Number(cfg?.executor?.maxInboundChecksPerCycle) || 5);
+  const toInspect = localCandidates.slice(0, inboundCap);
+  if (localCandidates.length > toInspect.length) {
+    console.error("[executor][inbound] max_inbound_checks_per_cycle cap", {
+      cap: inboundCap,
+      totalCandidates: localCandidates.length,
+      processingThisCycle: toInspect.length,
+      deferredToNextInboundPoll: localCandidates.length - toInspect.length,
+    });
+  }
+
+  for (const row of toInspect) {
     const ctx = findAccountContextByEmail(accountsPayload, row.fcAccount);
     if (!ctx) continue;
     const accountObj = (accountsPayload.accounts || []).find((a) => a.accountId === ctx.accountId);
@@ -648,7 +748,9 @@ async function executeOne({ cfg, enqueueAndWait }, row) {
       });
     }
     if (dep.status !== "Success") {
-      return { kind: "written", ok: false, reason: "dependency_not_ready", message: `dependency_not_ready:${dep.status}` };
+      // runOnce already set OutReach Status=Progress; must not return without writeback or the row is stuck
+      // (Todo filter never picks it up again).
+      return { kind: "skipped", message: `dependency_not_ready:${dep.status}` };
     }
   }
 
@@ -666,7 +768,7 @@ async function executeOne({ cfg, enqueueAndWait }, row) {
 
   let accountsPayload;
   try {
-    accountsPayload = await getAccountsPayload(enqueueAndWait, externalEventId);
+    accountsPayload = await getAccountsPayload(cfg, enqueueAndWait, externalEventId);
   } catch (e) {
     return await failWriteback({
       cfg,
@@ -890,24 +992,60 @@ async function failWriteback({ cfg, row, reason, detail, externalEventId }) {
 async function runOnce({ cfg, enqueueAndWait }) {
   const notionCfg = { token: cfg.notion.token, notionVersion: cfg.notion.notionVersion };
   const databaseId = cfg.notion.databaseId;
+  const now = new Date();
+  const lookbackMs = Number(cfg?.executor?.triggerLookbackMs) || 24 * 60 * 60 * 1000;
+  const horizonMs = Number(cfg?.executor?.triggerHorizonMs) || 30 * 60 * 1000;
+  const maxScanRows = Math.max(cfg.executor.pageSize, Number(cfg?.executor?.maxScanRows) || 200);
+  const lowerBound = new Date(now.valueOf() - lookbackMs);
+  const upperBound = new Date(now.valueOf() + horizonMs);
   console.error("[executor][outbound] notion query", {
     databaseId,
     pageSize: cfg.executor.pageSize,
+    maxScanRows,
     sorts: [{ property: "Trigger Time", direction: "ascending" }],
-    where: "Platform=Email AND InNOut=Out AND OutReach Status=Todo AND Action in (Send Email, Reply Email) AND FCAccount in local identities AND now in execute window",
+    triggerRangeLocal: {
+      onOrAfter: lowerBound.toString(),
+      onOrBefore: upperBound.toString(),
+    },
+    where:
+      "Trigger Time in [now-lookback, now+horizon] (Notion coarse filter) AND local eligibility checks: Platform=Email, InNOut=Out, OutReach Status=Todo, Action in (Send Email, Reply Email), FCAccount in local identities, now in execute window",
   });
+  let results = [];
+  try {
+    const queryRes = await queryOutboundCandidatePages({
+      notionCfg,
+      databaseId,
+      pageSize: cfg.executor.pageSize,
+      maxScanRows,
+      lowerBound,
+      upperBound,
+    });
+    results = queryRes.items;
+    console.error("[executor][outbound] notion filter plan selected", {
+      filterPlan: queryRes.filterPlan || "unknown",
+      scannedRows: results.length,
+    });
+    if (queryRes.truncated) {
+      console.error("[executor][outbound] scan capped by max_scan_rows", {
+        maxScanRows,
+        scanned: results.length,
+        hint: "Increase executor.max_scan_rows if foreign/shared queue rows are dense.",
+      });
+    }
+  } catch (e) {
+    // Final fallback only when all filter plans fail.
+    console.error("[executor][outbound] all notion filter plans failed, fallback to unfiltered first page", {
+      error: e?.message ?? e,
+    });
+    const data = await queryDatabase(notionCfg, databaseId, {
+      pageSize: cfg.executor.pageSize,
+      sorts: [{ property: "Trigger Time", direction: "ascending" }],
+    });
+    results = Array.isArray(data?.results) ? data.results : [];
+  }
 
-  const data = await queryDatabase(notionCfg, databaseId, {
-    pageSize: cfg.executor.pageSize,
-    sorts: [{ property: "Trigger Time", direction: "ascending" }],
-  });
-
-  const results = Array.isArray(data?.results) ? data.results : [];
-  const now = new Date();
-  const accountsPayload = await getAccountsPayload(enqueueAndWait, `run-${Date.now()}`);
-  const allowedSenders = listAllowedSenderEmails(accountsPayload);
-
-  const candidates = [];
+  /** Rows that pass all outbound filters except “FCAccount is a local identity” (needs listAccounts). */
+  const preFc = [];
   const rejectStats = {
     notEmailPlatform: 0,
     notOutDirection: 0,
@@ -916,6 +1054,7 @@ async function runOnce({ cfg, enqueueAndWait }) {
     fcAccountNotLocal: 0,
     outOfWindow: 0,
     payloadInvalid: 0,
+    listAccountsFailed: 0,
   };
   const rejectSamples = [];
   const sendEmailTodoRejectStats = {
@@ -947,7 +1086,7 @@ async function runOnce({ cfg, enqueueAndWait }) {
       continue;
     }
     const isSendTodo = row.actionText === "Send Email" && row.status === "Todo";
-    if (!row.fcAccount || !allowedSenders.has(row.fcAccount)) {
+    if (!row.fcAccount) {
       rejectStats.fcAccountNotLocal += 1;
       if (isSendTodo) {
         sendEmailTodoRejectStats.fcAccountNotLocal += 1;
@@ -955,17 +1094,15 @@ async function runOnce({ cfg, enqueueAndWait }) {
       if (rejectSamples.length < 20) {
         rejectSamples.push({
           taskId: row.taskId,
-          reason: "fcaccount_not_local",
+          reason: "missing_fcaccount",
           fcAccount: row.fcAccount,
-          localSenders: Array.from(allowedSenders).slice(0, 5),
         });
       }
       if (isSendTodo && sendEmailTodoRejectSamples.length < 20) {
         sendEmailTodoRejectSamples.push({
           taskId: row.taskId,
-          reason: "fcaccount_not_local",
+          reason: "missing_fcaccount",
           fcAccount: row.fcAccount,
-          localSenders: Array.from(allowedSenders).slice(0, 10),
         });
       }
       continue;
@@ -994,7 +1131,7 @@ async function runOnce({ cfg, enqueueAndWait }) {
       }
       continue;
     }
-    if (!isWithinWindow(row.executeWindow, now)) {
+    if (!isWithinWindow(row.executeWindow, now, cfg?.executor?.executeWindowGraceMs)) {
       rejectStats.outOfWindow += 1;
       if (isSendTodo) {
         sendEmailTodoRejectStats.outOfWindow += 1;
@@ -1019,10 +1156,56 @@ async function runOnce({ cfg, enqueueAndWait }) {
       }
       continue;
     }
-    candidates.push(row);
+    preFc.push(row);
   }
+
+  const candidates = [];
+  if (preFc.length > 0) {
+    let accountsPayload = null;
+    try {
+      accountsPayload = await getAccountsPayload(cfg, enqueueAndWait, `run-${Date.now()}`);
+    } catch (e) {
+      rejectStats.listAccountsFailed = preFc.length;
+      console.error("[executor][outbound] listAccounts failed (Thunderbird extension not responding?)", e?.message ?? e, {
+        deferredTaskCount: preFc.length,
+        hint: "Ensure the extension is enabled and polling GET /next on minimal-server.",
+      });
+    }
+    if (accountsPayload) {
+      const allowedSenders = listAllowedSenderEmails(accountsPayload);
+      for (const row of preFc) {
+        if (!allowedSenders.has(row.fcAccount)) {
+          rejectStats.fcAccountNotLocal += 1;
+          const isSendTodo = row.actionText === "Send Email" && row.status === "Todo";
+          if (isSendTodo) {
+            sendEmailTodoRejectStats.fcAccountNotLocal += 1;
+          }
+          if (rejectSamples.length < 20) {
+            rejectSamples.push({
+              taskId: row.taskId,
+              reason: "fcaccount_not_local",
+              fcAccount: row.fcAccount,
+              localSenders: Array.from(allowedSenders).slice(0, 5),
+            });
+          }
+          if (isSendTodo && sendEmailTodoRejectSamples.length < 20) {
+            sendEmailTodoRejectSamples.push({
+              taskId: row.taskId,
+              reason: "fcaccount_not_local",
+              fcAccount: row.fcAccount,
+              localSenders: Array.from(allowedSenders).slice(0, 10),
+            });
+          }
+          continue;
+        }
+        candidates.push(row);
+      }
+    }
+  }
+
   console.error("[executor][outbound] filtered candidates", {
     totalRows: results.length,
+    preFcEligible: preFc.length,
     candidates: candidates.length,
     candidateTaskIds: candidates.slice(0, 10).map((r) => r.taskId),
     rejectStats,
@@ -1042,7 +1225,18 @@ async function runOnce({ cfg, enqueueAndWait }) {
     });
   }
 
-  for (const row of candidates) {
+  const cap = cfg.executor.maxTasksPerCycle;
+  const toRun = cap > 0 && candidates.length > cap ? candidates.slice(0, cap) : candidates;
+  if (cap > 0 && candidates.length > toRun.length) {
+    console.error("[executor][outbound] max_tasks_per_cycle cap", {
+      cap,
+      totalEligible: candidates.length,
+      processingThisCycle: toRun.length,
+      deferredToNextPoll: candidates.length - toRun.length,
+    });
+  }
+
+  for (const row of toRun) {
     const externalEventId = computeExternalEventId(row.taskId, row.actionText);
     try {
       // claim first to avoid duplicate work across workers
@@ -1091,22 +1285,50 @@ async function runOnce({ cfg, enqueueAndWait }) {
       }
     }
   }
+  return {
+    totalRowsScanned: results.length,
+    candidates: candidates.length,
+    processed: toRun.length,
+  };
 }
 
 async function startExecutor({ cfg, enqueueAndWait }) {
   console.error("[executor] warmup executor started");
+  console.error("  mode =", cfg.executor.mode);
+  console.error("  enable_outbound =", cfg.executor.enableOutbound);
+  console.error("  enable_inbound =", cfg.executor.enableInbound);
   console.error("  poll_interval_ms =", cfg.executor.pollIntervalMs);
   console.error("  page_size =", cfg.executor.pageSize);
+  console.error("  max_tasks_per_cycle =", cfg.executor.maxTasksPerCycle || "(unlimited)");
+  console.error("  inbound_poll_interval_ms =", cfg.executor.inboundPollIntervalMs);
+  console.error("  max_inbound_checks_per_cycle =", cfg.executor.maxInboundChecksPerCycle);
+  if (!cfg.executor.enableOutbound && !cfg.executor.enableInbound) {
+    console.error("[executor] both outbound and inbound are disabled; executor loop will stay idle");
+  }
 
   // Initial delay is 0: run immediately on boot.
+  let nextInboundAt = 0;
   while (true) {
+    const cycleStart = Date.now();
+    let outbound = { totalRowsScanned: 0, candidates: 0, processed: 0 };
     try {
-      await runOnce({ cfg, enqueueAndWait });
-      await runInboundWatchOnce({ cfg, enqueueAndWait });
+      if (cfg.executor.enableOutbound) {
+        outbound = await runOnce({ cfg, enqueueAndWait });
+      }
+      const now = Date.now();
+      const outboundBusy = outbound.processed > 0 || outbound.candidates > 0;
+      if (cfg.executor.enableInbound && !outboundBusy && now >= nextInboundAt) {
+        await runInboundWatchOnce({ cfg, enqueueAndWait });
+        nextInboundAt = Date.now() + cfg.executor.inboundPollIntervalMs;
+      } else if (cfg.executor.enableInbound && outboundBusy) {
+        nextInboundAt = Math.max(nextInboundAt, now + 5000);
+      }
     } catch (e) {
       console.error("[executor] runOnce failed:", e?.message ?? e);
     }
-    await sleep(cfg.executor.pollIntervalMs);
+    const elapsed = Date.now() - cycleStart;
+    const waitMs = Math.max(0, cfg.executor.pollIntervalMs - elapsed);
+    await sleep(waitMs);
   }
 }
 

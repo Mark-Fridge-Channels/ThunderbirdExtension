@@ -7,8 +7,16 @@
   },
   "executor": {
     "enabled": true,
+    "mode": "both",
     "poll_interval_ms": 60000,
     "page_size": 20,
+    "max_scan_rows": 200,
+    "trigger_lookback_ms": 86400000,
+    "trigger_horizon_ms": 1800000,
+    "execute_window_grace_ms": 900000,
+    "accounts_cache_ms": 21600000,
+    "inbound_poll_interval_ms": 180000,
+    "max_inbound_checks_per_cycle": 5,
     "notion_property_names": {
       "Status": "OutReach Status",
       "subject": "Outreach Subject",

@@ -20,7 +20,11 @@ function notionHeaders({ token, notionVersion }) {
   };
 }
 
-async function notionFetch(cfg, method, path, body) {
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function notionFetch(cfg, method, path, body, attempt = 0) {
   const url = `${NOTION_API_BASE}${path}`;
   const res = await fetch(url, {
     method,
@@ -35,6 +39,12 @@ async function notionFetch(cfg, method, path, body) {
     data = { raw: text };
   }
   if (!res.ok) {
+    if (res.status === 429 && attempt < 5) {
+      const ra = parseInt(String(res.headers.get("retry-after") || ""), 10);
+      const backoffMs = Number.isFinite(ra) && ra > 0 ? ra * 1000 : Math.min(8000, 500 * 2 ** attempt);
+      await sleep(backoffMs);
+      return notionFetch(cfg, method, path, body, attempt + 1);
+    }
     const code = data?.code != null ? String(data.code) : "";
     const msg = data?.message || data?.error || `Notion API error: HTTP ${res.status}`;
     const combined = code ? `[${code}] ${msg}` : msg;

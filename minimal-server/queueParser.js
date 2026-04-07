@@ -47,10 +47,42 @@ function readEmailValue(prop) {
   return "";
 }
 
+function parseNotionDateToLocal(input) {
+  const raw = String(input || "").trim();
+  if (!raw) return null;
+  // Date-only value from Notion should be treated as local date midnight,
+  // not UTC midnight (which would shift by timezone).
+  const dateOnly = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (dateOnly) {
+    const y = Number(dateOnly[1]);
+    const m = Number(dateOnly[2]) - 1;
+    const d = Number(dateOnly[3]);
+    return new Date(y, m, d, 0, 0, 0, 0);
+  }
+  // Datetime without explicit timezone: parse as local wall-clock time.
+  const naiveDateTime = raw.match(
+    /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/
+  );
+  if (naiveDateTime) {
+    const y = Number(naiveDateTime[1]);
+    const m = Number(naiveDateTime[2]) - 1;
+    const d = Number(naiveDateTime[3]);
+    const hh = Number(naiveDateTime[4]);
+    const mm = Number(naiveDateTime[5]);
+    const ss = Number(naiveDateTime[6] || "0");
+    const ms = Number((naiveDateTime[7] || "0").padEnd(3, "0"));
+    return new Date(y, m, d, hh, mm, ss, ms);
+  }
+  // Datetime with timezone (e.g. Z or +08:00): Date() handles absolute instant.
+  const parsed = new Date(raw);
+  if (isNaN(parsed.valueOf())) return null;
+  return parsed;
+}
+
 function readDateRange(prop) {
   if (prop?.type !== "date") return { start: null, end: null };
-  const start = prop?.date?.start ? new Date(prop.date.start) : null;
-  const end = prop?.date?.end ? new Date(prop.date.end) : null;
+  const start = prop?.date?.start ? parseNotionDateToLocal(prop.date.start) : null;
+  const end = prop?.date?.end ? parseNotionDateToLocal(prop.date.end) : null;
   return { start, end };
 }
 
@@ -140,11 +172,12 @@ function normalizeEmail(text) {
   return m ? m[0].toLowerCase() : s;
 }
 
-function isWithinWindow({ start, end }, now = new Date()) {
+function isWithinWindow({ start, end }, now = new Date(), lateGraceMs = 0) {
   if (!(start instanceof Date) || isNaN(start.valueOf())) return false;
+  const grace = Number.isFinite(Number(lateGraceMs)) ? Math.max(0, Number(lateGraceMs)) : 0;
   if (end instanceof Date && !isNaN(end.valueOf())) {
-    // User requirement: strict bounds (now > start && now < end).
-    return now > start && now < end;
+    // Keep strict start boundary, and allow configurable late grace on end boundary.
+    return now > start && now < new Date(end.valueOf() + grace);
   }
   return now > start;
 }
