@@ -121,6 +121,10 @@ function loadConfig() {
         24 * 60 * 60 * 1000,
         asNonNegativeInt(executor.execute_window_grace_ms, 15 * 60 * 1000)
       ),
+      expiredStatusName:
+        typeof executor.expired_status_name === "string" && executor.expired_status_name.trim()
+          ? executor.expired_status_name.trim()
+          : "Expired",
       accountsCacheMs: Math.min(
         7 * 24 * 60 * 60 * 1000,
         Math.max(60 * 1000, asPositiveInt(executor.accounts_cache_ms, 6 * 60 * 60 * 1000))
@@ -159,6 +163,7 @@ function printConfigSummary(cfg) {
   console.error("  executor.trigger_lookback_ms =", cfg.executor.triggerLookbackMs);
   console.error("  executor.trigger_horizon_ms =", cfg.executor.triggerHorizonMs);
   console.error("  executor.execute_window_grace_ms =", cfg.executor.executeWindowGraceMs);
+  console.error("  executor.expired_status_name =", cfg.executor.expiredStatusName);
   console.error("  executor.accounts_cache_ms =", cfg.executor.accountsCacheMs);
   console.error("  executor.inbound_poll_interval_ms =", cfg.executor.inboundPollIntervalMs);
   console.error("  executor.max_inbound_checks_per_cycle =", cfg.executor.maxInboundChecksPerCycle);

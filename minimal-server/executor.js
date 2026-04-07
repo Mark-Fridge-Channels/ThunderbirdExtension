@@ -108,6 +108,19 @@ function makeDetail({ ok, reason, action, requestId, extensionResult, extensionE
   return JSON.stringify(payload, null, 2);
 }
 
+function classifyWindowTiming(executeWindow, now = new Date(), graceMs = 0) {
+  const start = executeWindow?.start;
+  const end = executeWindow?.end;
+  if (!(start instanceof Date) || isNaN(start.valueOf())) return "invalid";
+  const grace = Number.isFinite(Number(graceMs)) ? Math.max(0, Number(graceMs)) : 0;
+  if (now <= start) return "not_started";
+  if (end instanceof Date && !isNaN(end.valueOf())) {
+    if (now >= new Date(end.valueOf() + grace)) return "expired";
+    return "in_window";
+  }
+  return "in_window";
+}
+
 function getAccountsCacheMs(cfg) {
   const ms = Number(cfg?.executor?.accountsCacheMs);
   if (!Number.isFinite(ms) || ms < 60 * 1000) return 6 * 60 * 60 * 1000;
@@ -393,7 +406,25 @@ async function queryInboundPages(notionCfg, databaseId, pageSize) {
   return await queryDatabase(notionCfg, databaseId, { pageSize, filter });
 }
 
-async function queryOutboundCandidatePages({ notionCfg, databaseId, pageSize, maxScanRows, lowerBound, upperBound }) {
+function buildFcAccountFilter(localSenders, kind) {
+  const emails = Array.from(new Set((localSenders || []).map((x) => normalizeEmail(x)).filter(Boolean)));
+  if (emails.length === 0) return null;
+  if (kind === "rich_text_equals") {
+    return { or: emails.map((em) => ({ property: "FCAccount", rich_text: { equals: em } })) };
+  }
+  if (kind === "rich_text_contains") {
+    return { or: emails.map((em) => ({ property: "FCAccount", rich_text: { contains: em } })) };
+  }
+  if (kind === "email_equals") {
+    return { or: emails.map((em) => ({ property: "FCAccount", email: { equals: em } })) };
+  }
+  if (kind === "select_equals") {
+    return { or: emails.map((em) => ({ property: "FCAccount", select: { equals: em } })) };
+  }
+  return null;
+}
+
+async function queryOutboundCandidatePages({ notionCfg, databaseId, pageSize, maxScanRows, lowerBound, upperBound, localSenders = [] }) {
   const sorts = [{ property: "Trigger Time", direction: "ascending" }];
   const baseClauses = [
     { property: "Platform", select: { equals: "Email" } },
@@ -432,9 +463,28 @@ async function queryOutboundCandidatePages({ notionCfg, databaseId, pageSize, ma
       },
     },
   ];
+  const fcPlanKinds = ["rich_text_equals", "rich_text_contains", "email_equals", "select_equals"];
+  const fcPlans = [];
+  for (const k of fcPlanKinds) {
+    const fc = buildFcAccountFilter(localSenders, k);
+    if (!fc) continue;
+    fcPlans.push({
+      name: `status_filter=status,fc_filter=${k}`,
+      filter: { and: [...baseClauses, { property: "OutReach Status", status: { equals: "Todo" } }, fc] },
+    });
+    fcPlans.push({
+      name: `status_filter=select,fc_filter=${k}`,
+      filter: { and: [...baseClauses, { property: "OutReach Status", select: { equals: "Todo" } }, fc] },
+    });
+    fcPlans.push({
+      name: `status_filter=none,fc_filter=${k}`,
+      filter: { and: [...baseClauses, fc] },
+    });
+  }
+  const plans = fcPlans.length > 0 ? [...fcPlans, ...filterPlans] : filterPlans;
 
   let lastError = null;
-  for (const plan of filterPlans) {
+  for (const plan of plans) {
     try {
       const out = [];
       let cursor = undefined;
@@ -989,6 +1039,35 @@ async function failWriteback({ cfg, row, reason, detail, externalEventId }) {
   return { kind: "written", ok: false, reason };
 }
 
+async function expireWriteback({ cfg, row, detail, externalEventId }) {
+  const notionCfg = { token: cfg.notion.token, notionVersion: cfg.notion.notionVersion };
+  const propNames = cfg.executor?.notionPropertyNames;
+  const preferredStatus = cfg.executor?.expiredStatusName || "Expired";
+  const fallbackStatus = "Failed";
+  const tryWrite = async (statusName) => {
+    const props = buildWritebackProperties({
+      statusName,
+      executedAt: new Date(),
+      detailText: detail,
+      externalEventId: externalEventId ?? "",
+    }, propNames);
+    await updatePage(notionCfg, row.pageId, props);
+    return { kind: "written", ok: false, reason: "expired", statusName };
+  };
+  try {
+    return await tryWrite(preferredStatus);
+  } catch (e) {
+    if (preferredStatus === fallbackStatus) throw e;
+    console.error("[executor] writeback failed (expired, fallback to Failed)", {
+      taskId: row.taskId,
+      pageId: row.pageId,
+      preferredStatus,
+      error: e?.message ?? e,
+    });
+    return await tryWrite(fallbackStatus);
+  }
+}
+
 async function runOnce({ cfg, enqueueAndWait }) {
   const notionCfg = { token: cfg.notion.token, notionVersion: cfg.notion.notionVersion };
   const databaseId = cfg.notion.databaseId;
@@ -998,6 +1077,14 @@ async function runOnce({ cfg, enqueueAndWait }) {
   const maxScanRows = Math.max(cfg.executor.pageSize, Number(cfg?.executor?.maxScanRows) || 200);
   const lowerBound = new Date(now.valueOf() - lookbackMs);
   const upperBound = new Date(now.valueOf() + horizonMs);
+  let accountsPayload = null;
+  let allowedSenders = new Set();
+  try {
+    accountsPayload = await getAccountsPayload(cfg, enqueueAndWait, `run-${Date.now()}`);
+    allowedSenders = listAllowedSenderEmails(accountsPayload);
+  } catch (e) {
+    console.error("[executor][outbound] prefetch listAccounts failed", e?.message ?? e);
+  }
   console.error("[executor][outbound] notion query", {
     databaseId,
     pageSize: cfg.executor.pageSize,
@@ -1008,7 +1095,7 @@ async function runOnce({ cfg, enqueueAndWait }) {
       onOrBefore: upperBound.toString(),
     },
     where:
-      "Trigger Time in [now-lookback, now+horizon] (Notion coarse filter) AND local eligibility checks: Platform=Email, InNOut=Out, OutReach Status=Todo, Action in (Send Email, Reply Email), FCAccount in local identities, now in execute window",
+      "Trigger Time in [now-lookback, now+horizon] (Notion coarse filter) AND local eligibility checks: Platform=Email, InNOut=Out, OutReach Status=Todo, Action in (Send Email, Reply Email), FCAccount in local identities",
   });
   let results = [];
   try {
@@ -1019,6 +1106,7 @@ async function runOnce({ cfg, enqueueAndWait }) {
       maxScanRows,
       lowerBound,
       upperBound,
+      localSenders: Array.from(allowedSenders),
     });
     results = queryRes.items;
     console.error("[executor][outbound] notion filter plan selected", {
@@ -1053,6 +1141,7 @@ async function runOnce({ cfg, enqueueAndWait }) {
     actionMismatch: 0,
     fcAccountNotLocal: 0,
     outOfWindow: 0,
+    expired: 0,
     payloadInvalid: 0,
     listAccountsFailed: 0,
   };
@@ -1132,6 +1221,26 @@ async function runOnce({ cfg, enqueueAndWait }) {
       continue;
     }
     if (!isWithinWindow(row.executeWindow, now, cfg?.executor?.executeWindowGraceMs)) {
+      const timing = classifyWindowTiming(row.executeWindow, now, cfg?.executor?.executeWindowGraceMs);
+      if (timing === "expired") {
+        try {
+          const externalEventId = computeExternalEventId(row.taskId, row.actionText || "unknown");
+          await expireWriteback({
+            cfg,
+            row,
+            detail: `expired_window:${row.executeWindow?.end ? row.executeWindow.end.toISOString() : "no_end"}`,
+            externalEventId,
+          });
+          rejectStats.expired += 1;
+          continue;
+        } catch (e) {
+          // If expire writeback fails, keep old behavior as out-of-window reject (no crash).
+          console.error("[executor][outbound] expire writeback failed, keep as out_of_window", {
+            taskId: row.taskId,
+            error: e?.message ?? e,
+          });
+        }
+      }
       rejectStats.outOfWindow += 1;
       if (isSendTodo) {
         sendEmailTodoRejectStats.outOfWindow += 1;
@@ -1161,18 +1270,13 @@ async function runOnce({ cfg, enqueueAndWait }) {
 
   const candidates = [];
   if (preFc.length > 0) {
-    let accountsPayload = null;
-    try {
-      accountsPayload = await getAccountsPayload(cfg, enqueueAndWait, `run-${Date.now()}`);
-    } catch (e) {
+    if (!accountsPayload) {
       rejectStats.listAccountsFailed = preFc.length;
-      console.error("[executor][outbound] listAccounts failed (Thunderbird extension not responding?)", e?.message ?? e, {
+      console.error("[executor][outbound] listAccounts failed (Thunderbird extension not responding?)", {
         deferredTaskCount: preFc.length,
         hint: "Ensure the extension is enabled and polling GET /next on minimal-server.",
       });
-    }
-    if (accountsPayload) {
-      const allowedSenders = listAllowedSenderEmails(accountsPayload);
+    } else {
       for (const row of preFc) {
         if (!allowedSenders.has(row.fcAccount)) {
           rejectStats.fcAccountNotLocal += 1;

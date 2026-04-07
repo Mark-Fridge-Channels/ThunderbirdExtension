@@ -14,6 +14,7 @@
     "trigger_lookback_ms": 86400000,
     "trigger_horizon_ms": 1800000,
     "execute_window_grace_ms": 900000,
+    "expired_status_name": "Expired",
     "accounts_cache_ms": 21600000,
     "inbound_poll_interval_ms": 180000,
     "max_inbound_checks_per_cycle": 5,
