@@ -47,6 +47,10 @@
     "tb_active_receiver_standalone@markbai.thunderbird.local": {
       "updates": [
         {
+          "version": "1.0.16",
+          "update_link": "https://github.com/Mark-Fridge-Channels/ThunderbirdExtension/releases/download/v1.0.16/tb-active-receiver-1.0.16.xpi"
+        },
+        {
           "version": "1.0.15",
           "update_link": "https://github.com/Mark-Fridge-Channels/ThunderbirdExtension/releases/download/v1.0.15/tb-active-receiver-1.0.15.xpi"
         },

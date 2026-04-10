@@ -83,6 +83,23 @@ async function messageHasAttachments(messageId) {
   }
 }
 
+function messageReceivedAtIso(header) {
+  const d = header?.date;
+  if (d instanceof Date && Number.isFinite(d.valueOf())) {
+    return d.toISOString();
+  }
+  if (typeof d === "number" && Number.isFinite(d)) {
+    const n = new Date(d);
+    if (Number.isFinite(n.valueOf())) return n.toISOString();
+  }
+  if (typeof d === "string" && d.trim()) {
+    const s = new Date(d);
+    if (Number.isFinite(s.valueOf())) return s.toISOString();
+  }
+  // Fallback when message header has no valid date.
+  return new Date().toISOString();
+}
+
 /**
  * @param {number} messageId
  * @param {string} accountId
@@ -136,7 +153,7 @@ export async function buildTbWebhookPayload(messageId, accountId, folderId, incl
   return {
     schemaVersion: 1,
     type: "tb-active-receiver.newMail",
-    receivedAt: new Date().toISOString(),
+    receivedAt: messageReceivedAtIso(header),
     fcAccount,
     accountId,
     folderId: folderId ?? header.folder?.id ?? null,
