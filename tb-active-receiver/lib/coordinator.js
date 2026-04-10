@@ -8,6 +8,8 @@ import * as registry from "./registry.js";
 import * as scheduler from "./scheduler.js";
 import * as activeFetcher from "./activeFetcher.js";
 import { attachNewMailListener } from "./replyDetector.js";
+import { runInboxReconcile } from "./inboxReconcile.js";
+import { drainReportQueue } from "./reportDelivery.js";
 
 const browser = globalThis.browser ?? globalThis.messenger;
 
@@ -73,6 +75,8 @@ export async function runPollCycle() {
     await scheduleSettleFromOptions();
   } catch (e) {
     console.warn("[TB Active Receiver] poll cycle", e?.message ?? e);
+  } finally {
+    await drainReportQueue(25);
   }
 }
 
@@ -136,6 +140,7 @@ async function reattachNewMailListener() {
 async function syncSchedulerWithOptions() {
   const options = await state.loadOptions();
   await scheduler.ensurePollAlarm(options.pollIntervalMinutes, options.enabled);
+  await scheduler.ensureReconcileAlarm(options.enabled, options.reconcileInboxMinutes ?? 1440);
 }
 
 /**
@@ -156,6 +161,7 @@ export async function stop() {
   await state.saveOptions({ enabled: false });
   await scheduler.clearPollAlarm();
   await scheduler.clearSettleAlarm();
+  await scheduler.clearReconcileAlarm();
 }
 
 export async function getStatus() {
@@ -168,6 +174,8 @@ export function registerAlarmAndMessageHandlers() {
       void runPollCycle();
     } else if (alarm.name === scheduler.ALARM_SETTLE) {
       void onSettleAlarm();
+    } else if (alarm.name === scheduler.ALARM_RECONCILE) {
+      void runInboxReconcile().catch((e) => console.warn("[TB Active Receiver] reconcile alarm", e?.message ?? e));
     }
   });
 
@@ -230,6 +238,13 @@ export function registerAlarmAndMessageHandlers() {
       return true;
     }
 
+    if (msg.type === "tbActiveRx.reconcileInboxNow") {
+      runInboxReconcile()
+        .then(() => sendResponse({ ok: true }))
+        .catch((e) => sendResponse({ ok: false, error: e?.message ?? String(e) }));
+      return true;
+    }
+
     return false;
   });
 }
@@ -238,4 +253,7 @@ export async function bootstrap() {
   browser.runtime.onStartup.addListener(() => {});
   registerAlarmAndMessageHandlers();
   await init();
+  setTimeout(() => {
+    runInboxReconcile().catch((e) => console.warn("[TB Active Receiver] startup reconcile", e?.message ?? e));
+  }, 12000);
 }

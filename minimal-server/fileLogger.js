@@ -112,6 +112,7 @@ function summarizeWebhookPayload(p) {
     bodyPlainLen: typeof p.bodyPlain === "string" ? p.bodyPlain.length : 0,
     bodyHtmlLen: typeof p.bodyHtml === "string" ? p.bodyHtml.length : 0,
     hasAttachments: p.hasAttachments,
+    reportSource: p.reportSource,
   };
 }
 
@@ -126,6 +127,26 @@ function summarizeWebhookResponse(body) {
     detail: typeof body.detail === "string" ? body.detail.slice(0, 300) : body.detail,
   };
   return o;
+}
+
+/** First-line audit: TCP/HTTP accepted for webhook path (before body fully read). */
+function logTbReceiverRequestReceived({ client, path, contentLength }) {
+  if (!opts.enabled) return;
+  try {
+    appendLine(
+      `[webhook-audit] ${JSON.stringify({
+        outcome: "http_received",
+        client: client || "",
+        path: path || "",
+        contentLength:
+          contentLength != null && contentLength !== "" && Number.isFinite(Number(contentLength))
+            ? Number(contentLength)
+            : null,
+      })}`
+    );
+  } catch (_) {
+    /* ignore */
+  }
 }
 
 /**
@@ -147,5 +168,6 @@ module.exports = {
   appendLine,
   summarizeWebhookPayload,
   summarizeWebhookResponse,
+  logTbReceiverRequestReceived,
   logTbReceiverWebhook,
 };

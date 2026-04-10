@@ -6,6 +6,8 @@ const browser = globalThis.browser ?? globalThis.messenger;
 
 export const ALARM_POLL = "tbActiveReceiver.poll";
 export const ALARM_SETTLE = "tbActiveReceiver.settle";
+/** Daily Inbox reconcile (3 local calendar days). */
+export const ALARM_RECONCILE = "tbActiveReceiver.reconcile";
 
 export async function ensurePollAlarm(intervalMinutes, enabled) {
   const existing = await browser.alarms.get(ALARM_POLL);
@@ -35,4 +37,22 @@ export async function scheduleSettleAlarm(delayMs) {
 
 export async function clearSettleAlarm() {
   await browser.alarms.clear(ALARM_SETTLE);
+}
+
+/** ~24h period for Inbox backfill (TB alarm minimum is 1 minute). */
+export async function ensureReconcileAlarm(enabled, periodMinutes) {
+  const period = Math.max(60, Math.min(7 * 24 * 60, Number(periodMinutes) || 24 * 60));
+  const existing = await browser.alarms.get(ALARM_RECONCILE);
+  if (!enabled) {
+    if (existing) await browser.alarms.clear(ALARM_RECONCILE);
+    return;
+  }
+  if (!existing || existing.periodInMinutes !== period) {
+    await browser.alarms.clear(ALARM_RECONCILE);
+    await browser.alarms.create(ALARM_RECONCILE, { periodInMinutes: period });
+  }
+}
+
+export async function clearReconcileAlarm() {
+  await browser.alarms.clear(ALARM_RECONCILE);
 }

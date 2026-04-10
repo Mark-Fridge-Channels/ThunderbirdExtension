@@ -29,6 +29,15 @@
 - [x] 🟩 **Step 2（66%）发信回填缓存**：`successWriteback` 成功后按 `fcAccount` + 收件人邮箱（`partnerEmail` / `counterpartyEmail` / `payload.to`）写入 `inbound-contact-cache.json`，已有键不覆盖（first-write wins）；失败只打日志不影响回写。
 - [x] 🟩 **Step 3（100%）外发 Reply Status**：成功回写不再把外发行的 `Reply Status` 置为 `Todo`（与「不靠 reply 状态驱动监听」一致）；入站轮询仍可在开启时 `markReplyDone`。
 
+## TB Active Receiver：队列、Inbox 对账、审计日志（2026-04）
+
+**Progress:** `100%`
+
+- [x] 🟩 **Step 1（25%）上报队列与重试**：`reportDelivery.js` 持久队列 + 成功 ACK（按 `messageId` 修剪）；失败轮转重试；队列满时拒绝新入队（不丢队首待发送项）；`4xx(非429)` 直接判定不可恢复并丢弃打日志；轮询周期末 `drainReportQueue(25)`。
+- [x] 🟩 **Step 2（50%）仅 Inbox + 新邮件入队**：`replyDetector.js` 仅对「轮询账号的 Inbox」`enqueueInboxReportJob`；JSON 增加 `reportSource`: `newMail` / `reconcile`。
+- [x] 🟩 **Step 3（75%）本地 3 日对账**：`inboxReconcile.js` 按客户端本地日历从「今日往前共 3 个自然日」的 00:00 起至 `now` 查询每账号 Inbox；`tbActiveReceiverInboxReconcileWatermark` 按 `accountId:inboxFolderId` 记录上次完成时间；启动约 12s 后首次对账 + `alarms` 默认每 24h；`tbActiveRx.reconcileInboxNow` 可手动触发。
+- [x] 🟩 **Step 4（100%）minimal-server 审计首行**：`fileLogger.logTbReceiverRequestReceived` 在 webhook 路由匹配后、读 body 前写 `[webhook-audit] http_received`；保留原有 `[webhook]` 处理结果行。
+
 ## InteractionLOG schema alignment（2026-04）
 
 - [x] 🟩 **OutReach Status**：通过 `executor.notion_property_names.Status` 映射写回；解析支持 `OutReach Status` / `Status` 别名。

@@ -1,183 +1,56 @@
 /**
- * messages.onNewMailReceived: reply heuristics + optional HTTP report + lastNewMailAt.
- * Report JSON includes schemaVersion, plain+HTML bodies (optional), and fcAccount for minimal-server webhook.
+ * messages.onNewMailReceived: Inbox-only enqueue for webhook + touch lastNewMailAt.
+ * Actual POST runs through reportDelivery queue (retries, reconcile dedupe).
  */
 
+import * as registry from "./registry.js";
 import * as state from "./state.js";
-import { extractBodyFromMessagePart } from "./messageBody.js";
+import { enqueueInboxReportJob, drainReportQueue } from "./reportDelivery.js";
 
 const browser = globalThis.browser ?? globalThis.messenger;
 
-function headerValue(headers, name) {
-  if (!headers || typeof headers !== "object") return "";
-  const key = name.toLowerCase();
-  const raw = headers[key];
-  if (Array.isArray(raw)) {
-    return raw.map((x) => String(x)).join(" ");
-  }
-  return raw != null ? String(raw) : "";
+async function loadInboxKeys() {
+  const accounts = await registry.getPollingAccounts();
+  return new Set(accounts.map((a) => `${a.accountId}:${a.inboxFolderId}`));
 }
 
-function collectHeadersFromFull(part, out) {
-  if (!part) return;
-  if (part.headers && typeof part.headers === "object") {
-    for (const k of Object.keys(part.headers)) {
-      if (!out[k]) out[k] = part.headers[k];
-    }
-  }
-  if (Array.isArray(part.parts)) {
-    for (const p of part.parts) collectHeadersFromFull(p, out);
-  }
-}
-
-function replyHeuristic({ subject = "", inReplyTo = "", references = "", trackedIds }) {
-  const subj = String(subject || "").trim();
-  const irt = String(inReplyTo || "").trim();
-  const refs = String(references || "").trim();
-  if (irt || refs) {
-    if (trackedIds?.size) {
-      const blob = `${irt} ${refs}`.toLowerCase();
-      for (const id of trackedIds) {
-        if (id && blob.includes(String(id).toLowerCase().replace(/[<>]/g, "").trim())) {
-          return { isReply: true, reason: "in-reply-to-refs-tracked" };
-        }
-      }
-    }
-    return { isReply: true, reason: "in-reply-to-or-refs" };
-  }
-  if (/^re:\s/i.test(subj)) {
-    return { isReply: true, reason: "subject-re-prefix" };
-  }
-  return { isReply: false, reason: "none" };
-}
-
-async function loadTrackedIds() {
-  const { tbActiveReceiverTrackedIds } = await browser.storage.local.get("tbActiveReceiverTrackedIds");
-  const list = Array.isArray(tbActiveReceiverTrackedIds) ? tbActiveReceiverTrackedIds : [];
-  return new Set(list.map((x) => String(x).trim()).filter(Boolean));
-}
-
-/** Default identity email for this mail account (normalized lowercase). Used as FCAccount on the server. */
-async function resolveDefaultIdentityEmail(accountId) {
-  if (!accountId) return "";
-  try {
-    const acc = await browser.accounts.get(accountId);
-    const identities = Array.isArray(acc?.identities) ? acc.identities : [];
-    let preferred = null;
-    if (acc.defaultIdentityId) {
-      preferred = identities.find((i) => i && i.id === acc.defaultIdentityId);
-    }
-    if (!preferred) {
-      preferred = identities.find((i) => i && i.default) || identities[0];
-    }
-    const em = preferred?.email ? String(preferred.email).trim().toLowerCase() : "";
-    return em;
-  } catch (_) {
-    return "";
-  }
-}
-
-async function messageHasAttachments(messageId) {
-  try {
-    const m = await browser.messages.get(messageId);
-    return Array.isArray(m?.attachments) && m.attachments.length > 0;
-  } catch (_) {
-    return false;
-  }
-}
-
-async function postReport(url, body, secret) {
-  if (!url) return;
-  try {
-    const headers = { "Content-Type": "application/json" };
-    const s = String(secret || "").trim();
-    if (s) headers["X-TB-Receiver-Secret"] = s;
-    const r = await fetch(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-    });
-    if (!r.ok) {
-      console.warn("[TB Active Receiver] report failed", r.status);
-    }
-  } catch (e) {
-    console.warn("[TB Active Receiver] report error", e?.message ?? e);
-  }
+function isPollingInboxFolder(folder, header, inboxKeys) {
+  const aid = header.folder?.accountId ?? folder?.accountId;
+  const fid = header.folder?.id ?? folder?.id;
+  if (!aid || fid == null) return false;
+  return inboxKeys.has(`${aid}:${fid}`);
 }
 
 export async function handleNewMailFolderBatch(folder, messages) {
   const options = await state.loadOptions();
   const reportUrl = options.reportUrl ? String(options.reportUrl).trim() : "";
-  const includeBody = options.reportIncludeBody !== false;
 
   await browser.storage.session.set({ tbActiveReceiverRoundHadNewMail: true });
 
-  const trackedIds = await loadTrackedIds();
+  const inboxKeys = await loadInboxKeys();
   const msgList = messages?.messages ?? [];
   for (const header of msgList) {
     if (!header?.id) continue;
-    let inReplyTo = "";
-    let references = "";
-    let bodyPlain = "";
-    let bodyHtml = "";
-
-    try {
-      const full = await browser.messages.getFull(header.id, { decodeContent: includeBody });
-      const merged = {};
-      collectHeadersFromFull(full, merged);
-      inReplyTo = headerValue(merged, "in-reply-to");
-      references = headerValue(merged, "references");
-      if (includeBody) {
-        const extracted = extractBodyFromMessagePart(full);
-        bodyPlain = extracted.plain || "";
-        bodyHtml = extracted.htmlFallback || "";
-      }
-    } catch (_) {
-      /* header/body unavailable */
-    }
-
-    const { isReply, reason } = replyHeuristic({
-      subject: header.subject,
-      inReplyTo,
-      references,
-      trackedIds,
-    });
+    if (!isPollingInboxFolder(folder, header, inboxKeys)) continue;
 
     const accountId = header.folder?.accountId ?? folder?.accountId ?? null;
     if (accountId) {
       await state.touchNewMail(accountId);
     }
 
-    if (reportUrl) {
-      const fcAccount = await resolveDefaultIdentityEmail(accountId);
-      if (!fcAccount) {
-        console.warn("[TB Active Receiver] skip report: no identity email for account", accountId);
-        continue;
-      }
-      const hasAttachments = await messageHasAttachments(header.id);
-      await postReport(
-        reportUrl,
-        {
-        schemaVersion: 1,
-        type: "tb-active-receiver.newMail",
-        receivedAt: new Date().toISOString(),
-        fcAccount,
-        accountId,
-        folderId: folder?.id ?? header.folder?.id ?? null,
+    if (reportUrl && accountId) {
+      const folderId = folder?.id ?? header.folder?.id ?? null;
+      await enqueueInboxReportJob({
         messageId: header.id,
-        headerMessageId: header.headerMessageId ?? null,
-        author: header.author ?? "",
-        subject: header.subject ?? "",
-        bodyPlain,
-        bodyHtml,
-        hasAttachments,
-        isReplyHint: isReply,
-        replyHintReason: reason,
-        inReplyTo: inReplyTo || null,
-        },
-        options.reportSecret
-      );
+        accountId,
+        folderId,
+        reason: "newMail",
+      });
     }
+  }
+
+  if (reportUrl) {
+    await drainReportQueue();
   }
 }
 

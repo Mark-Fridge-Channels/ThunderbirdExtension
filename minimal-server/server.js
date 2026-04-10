@@ -184,6 +184,11 @@ const server = http.createServer((req, res) => {
   const webhookPath = String(runtimeCfg?.executor?.tbReceiverReportPath || "/tb-active-receiver/report").split("?")[0];
   if (req.method === "POST" && path === webhookPath) {
     const client = req.socket?.remoteAddress || "";
+    fileLogger.logTbReceiverRequestReceived({
+      client,
+      path,
+      contentLength: req.headers["content-length"],
+    });
     if (!runtimeCfg) {
       fileLogger.logTbReceiverWebhook({
         outcome: "no_config",
