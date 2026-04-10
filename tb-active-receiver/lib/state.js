@@ -15,7 +15,7 @@ const K = {
 
 const DEFAULT_OPTIONS = {
   enabled: true,
-  pollIntervalMinutes: 1,
+  pollIntervalMinutes: 5,
   pollAllAccounts: true,
   monitorAllFolders: true,
   /** Persisted override; empty means use built-in default (see loadOptions). */
