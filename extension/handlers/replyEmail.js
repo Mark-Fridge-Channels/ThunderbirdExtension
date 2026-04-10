@@ -5,8 +5,10 @@
 
 import { normalizeSendResult } from "../shared/bridgeNormalize.js";
 import { makeError, CODES } from "../shared/errors.js";
+import { waitForAfterSend, cancelAfterSendWait } from "../shared/composeAfterSend.js";
 
 const browser = globalThis.browser ?? globalThis.messenger;
+const AFTER_SEND_TIMEOUT_MS = 90000;
 
 async function resolveIdentity(accountId, identityId) {
   if (identityId) return identityId;
@@ -62,17 +64,56 @@ export async function handleReplyEmail({ payload }) {
     return { success: false, error: makeError(CODES.VALIDATION, "sendMode must be default | sendNow | sendLater") };
   }
 
+  let composeTabId = null;
   try {
     const tab = await browser.compose.beginReply(messageId, replyType, details);
     if (!tab?.id) {
       return { success: false, error: makeError(CODES.API_ERROR, "compose.beginReply did not return a tab") };
     }
-    const result = await browser.compose.sendMessage(tab.id, { mode: sendMode });
-    return { success: true, result: normalizeSendResult(result) };
+    composeTabId = tab.id;
+    const afterSendPromise = waitForAfterSend(composeTabId, AFTER_SEND_TIMEOUT_MS);
+    const result = await browser.compose.sendMessage(composeTabId, { mode: sendMode });
+    const afterSend = await afterSendPromise;
+    if (afterSend?.error) {
+      return {
+        success: false,
+        error: makeError(CODES.API_ERROR, afterSend.error, {
+          phase: "onAfterSend",
+          mode: afterSend?.mode ?? sendMode,
+          sendInfo: afterSend,
+          sendMessageResult: normalizeSendResult(result),
+        }),
+      };
+    }
+    const normalized = normalizeSendResult(afterSend?.mode ? afterSend : result);
+    if (normalized.mode !== "sendLater" && !normalized.headerMessageId) {
+      return {
+        success: false,
+        error: makeError(CODES.API_ERROR, "Missing headerMessageId after send", {
+          phase: "onAfterSend",
+          mode: normalized.mode,
+          sendInfo: afterSend,
+          sendMessageResult: normalizeSendResult(result),
+        }),
+      };
+    }
+    return { success: true, result: normalized };
   } catch (e) {
+    if (e?.message && /compose\.onAfterSend timeout/i.test(String(e.message))) {
+      return {
+        success: false,
+        error: makeError(CODES.TIMEOUT, e.message),
+      };
+    }
     return {
       success: false,
       error: makeError(CODES.API_ERROR, e?.message ?? String(e)),
     };
+  } finally {
+    try {
+      if (composeTabId != null) cancelAfterSendWait(composeTabId);
+    } catch (_) {
+      // ignore
+    }
   }
 }

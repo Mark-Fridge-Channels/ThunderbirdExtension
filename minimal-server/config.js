@@ -137,6 +137,14 @@ function loadConfig() {
         200,
         Math.max(1, asPositiveInt(executor.max_inbound_checks_per_cycle, 5))
       ),
+      inboundMessageLimit: Math.min(
+        5000,
+        Math.max(100, asPositiveInt(executor.inbound_message_limit, 2000))
+      ),
+      inboundContactCachePath:
+        typeof executor.inbound_contact_cache_path === "string" && executor.inbound_contact_cache_path.trim()
+          ? executor.inbound_contact_cache_path.trim()
+          : "inbound-contact-cache.json",
       addressBookId: typeof executor.address_book_id === "string" ? executor.address_book_id.trim() : "",
       notionPropertyNames,
     },
@@ -167,6 +175,8 @@ function printConfigSummary(cfg) {
   console.error("  executor.accounts_cache_ms =", cfg.executor.accountsCacheMs);
   console.error("  executor.inbound_poll_interval_ms =", cfg.executor.inboundPollIntervalMs);
   console.error("  executor.max_inbound_checks_per_cycle =", cfg.executor.maxInboundChecksPerCycle);
+  console.error("  executor.inbound_message_limit =", cfg.executor.inboundMessageLimit);
+  console.error("  executor.inbound_contact_cache_path =", cfg.executor.inboundContactCachePath);
   console.error("  executor.address_book_id =", cfg.executor.addressBookId ? cfg.executor.addressBookId : "(empty)");
 }
 

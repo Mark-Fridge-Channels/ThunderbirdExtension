@@ -13,12 +13,17 @@
 
 const { queryDatabase, updatePage, createPage, getPage } = require("./notion.js");
 const { parseQueueRow, isWithinWindow, computeExternalEventId, readSelectName, readEmailValue } = require("./queueParser.js");
+const fs = require("fs");
+const path = require("path");
 
 /** Cache listAccounts to avoid hammering the extension (same process, short TTL). */
 let accountsCache = { at: 0, data: null };
 
 /** KeyPerson page id -> normalized email (process lifetime). */
 const keyPersonEmailCache = new Map();
+
+/** Inbound contact cache persisted in JSON (permanent, first-write wins). */
+let inboundContactCacheState = null;
 
 function nowIso() {
   return new Date().toISOString();
@@ -339,6 +344,186 @@ function normalizeEmail(text) {
   return extractEmail(text || "").trim().toLowerCase();
 }
 
+function buildInboundCacheKey(fcAccount, counterpartyEmail) {
+  return `${normalizeEmail(fcAccount)}|${normalizeEmail(counterpartyEmail)}`;
+}
+
+function getInboundCachePath(cfg) {
+  const p = String(cfg?.executor?.inboundContactCachePath || "").trim();
+  if (!p) return path.join(__dirname, "inbound-contact-cache.json");
+  if (path.isAbsolute(p)) return p;
+  return path.join(__dirname, p);
+}
+
+function safeJsonParse(raw, fallback) {
+  try {
+    return JSON.parse(String(raw || ""));
+  } catch (_) {
+    return fallback;
+  }
+}
+
+function loadInboundContactCache(cfg) {
+  if (inboundContactCacheState) return inboundContactCacheState;
+  const cachePath = getInboundCachePath(cfg);
+  let parsed = null;
+  try {
+    const raw = fs.readFileSync(cachePath, "utf8");
+    parsed = safeJsonParse(raw, null);
+  } catch (_) {
+    parsed = null;
+  }
+  const entries = Array.isArray(parsed?.entries) ? parsed.entries : [];
+  const byKey = new Map();
+  for (const e of entries) {
+    const fc = normalizeEmail(e?.fcAccount);
+    const cp = normalizeEmail(e?.counterpartyEmail);
+    const kp = String(e?.keyPersonId || "").trim();
+    if (!fc || !cp || !kp) continue;
+    const k = buildInboundCacheKey(fc, cp);
+    // first-write wins
+    if (!byKey.has(k)) byKey.set(k, { fcAccount: fc, counterpartyEmail: cp, keyPersonId: kp });
+  }
+  inboundContactCacheState = {
+    path: cachePath,
+    byKey,
+    lastScanAtByAccount: parsed?.lastScanAtByAccount && typeof parsed.lastScanAtByAccount === "object"
+      ? { ...parsed.lastScanAtByAccount }
+      : {},
+  };
+  return inboundContactCacheState;
+}
+
+function saveInboundContactCache(state) {
+  if (!state?.path) return;
+  const entries = Array.from(state.byKey.values());
+  const payload = {
+    version: 1,
+    updatedAt: nowIso(),
+    entries,
+    lastScanAtByAccount: state.lastScanAtByAccount || {},
+  };
+  const dir = path.dirname(state.path);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(state.path, JSON.stringify(payload, null, 2), "utf8");
+}
+
+function dedupeIdForInboundMessage(msg) {
+  const hid = String(msg?.headerMessageId || "").trim();
+  if (hid) return { value: hid, kind: "headerMessageId" };
+  const mid = String(msg?.messageId || "").trim();
+  if (mid) return { value: mid, kind: "messageId" };
+  return { value: "", kind: "none" };
+}
+
+async function queryAllInboundPages(notionCfg, databaseId, pageSize) {
+  const out = [];
+  let cursor = undefined;
+  while (true) {
+    const data = await queryInboundPages(notionCfg, databaseId, pageSize, cursor);
+    const chunk = Array.isArray(data?.results) ? data.results : [];
+    out.push(...chunk);
+    if (!data?.has_more || !data?.next_cursor || chunk.length === 0) break;
+    cursor = data.next_cursor;
+  }
+  return out;
+}
+
+async function queryAllSuccessOutPages(notionCfg, databaseId, pageSize) {
+  const out = [];
+  let cursor = undefined;
+  const filter = {
+    and: [
+      { property: "Platform", select: { equals: "Email" } },
+      { property: "InNOut", select: { equals: "Out" } },
+      {
+        or: [
+          { property: "Action", select: { equals: "Send Email" } },
+          { property: "Action", select: { equals: "Reply Email" } },
+        ],
+      },
+      {
+        or: [
+          { property: "OutReach Status", status: { equals: "Success" } },
+          { property: "OutReach Status", select: { equals: "Success" } },
+        ],
+      },
+    ],
+  };
+  const sorts = [{ property: "Completion Time", direction: "ascending" }];
+  while (true) {
+    const data = await queryDatabase(notionCfg, databaseId, {
+      pageSize,
+      sorts,
+      filter,
+      startCursor: cursor,
+    });
+    const chunk = Array.isArray(data?.results) ? data.results : [];
+    out.push(...chunk);
+    if (!data?.has_more || !data?.next_cursor || chunk.length === 0) break;
+    cursor = data.next_cursor;
+  }
+  return out;
+}
+
+function buildOutboundCacheCandidates(rows, allowedSenders) {
+  const result = [];
+  for (const row of rows || []) {
+    const fc = normalizeEmail(row?.fcAccount);
+    const cp = normalizeEmail(row?.counterpartyEmail);
+    const kp = String(row?.keyPersonPageId || "").trim();
+    if (!fc || !cp || !kp) continue;
+    if (allowedSenders && !allowedSenders.has(fc)) continue;
+    result.push({
+      fcAccount: fc,
+      counterpartyEmail: cp,
+      keyPersonId: kp,
+      row,
+    });
+  }
+  return result;
+}
+
+function buildInboundDedupKey(fcAccount, inboundMsg) {
+  const fc = normalizeEmail(fcAccount);
+  const id = dedupeIdForInboundMessage(inboundMsg);
+  if (!fc || !id.value) return "";
+  return `${fc}|${id.value}`;
+}
+
+function collectInboundDedupKeys(pages) {
+  const keys = new Set();
+  for (const page of pages || []) {
+    const row = parseQueueRow(page);
+    const fc = normalizeEmail(row?.fcAccount);
+    const payload = row?.payload || {};
+    const hid = String(payload?.headerMessageId || payload?.messageHeaderId || "").trim();
+    const mid = String(payload?.messageId || "").trim();
+    const id = hid || mid;
+    if (fc && id) keys.add(`${fc}|${id}`);
+  }
+  return keys;
+}
+
+function findBestMatchingOutRow(rows, fcAccount, counterpartyEmail, subjectText) {
+  const fc = normalizeEmail(fcAccount);
+  const cp = normalizeEmail(counterpartyEmail);
+  if (!fc || !cp) return null;
+  const normalizedInboundSubject = normalizeSubjectForMatch(subjectText);
+  let fallback = null;
+  for (const row of rows || []) {
+    if (normalizeEmail(row?.fcAccount) !== fc) continue;
+    if (normalizeEmail(row?.counterpartyEmail) !== cp) continue;
+    if (!fallback) fallback = row;
+    const outNormalized = normalizeSubjectForMatch(row?.subject || "");
+    if (outNormalized && normalizedInboundSubject && outNormalized === normalizedInboundSubject) return row;
+    if (outNormalized && normalizedInboundSubject && String(subjectText || "").toLowerCase().includes(outNormalized)) {
+      return row;
+    }
+  }
+  return fallback;
+}
+
 function escapeHtml(text) {
   return String(text || "")
     .replace(/&/g, "&amp;")
@@ -396,14 +581,14 @@ function resolveBodyForCompose(rawBody, explicitBodyFormat) {
   return { bodyFormat: "plain", body };
 }
 
-async function queryInboundPages(notionCfg, databaseId, pageSize) {
+async function queryInboundPages(notionCfg, databaseId, pageSize, startCursor) {
   const filter = {
     and: [
       { property: "Platform", select: { equals: "Email" } },
       { property: "InNOut", select: { equals: "In" } },
     ],
   };
-  return await queryDatabase(notionCfg, databaseId, { pageSize, filter });
+  return await queryDatabase(notionCfg, databaseId, { pageSize, filter, startCursor });
 }
 
 function buildFcAccountFilter(localSenders, kind) {
@@ -519,17 +704,7 @@ async function queryOutboundCandidatePages({ notionCfg, databaseId, pageSize, ma
   throw lastError || new Error("outbound_query_all_filter_plans_failed");
 }
 
-function collectInboundHeaderIds(pages) {
-  const ids = new Set();
-  for (const page of pages || []) {
-    const row = parseQueueRow(page);
-    const hid = row?.payload?.headerMessageId || row?.payload?.messageHeaderId;
-    if (hid) ids.add(String(hid));
-  }
-  return ids;
-}
-
-function buildInboundCreateProperties(sourceRow, inboundMsg, propNames) {
+function buildInboundCreateProperties(sourceRow, inboundMsg, propNames, keyPersonId) {
   const p = propNames || {};
   const srcPage = sourceRow?.raw;
   const props = {};
@@ -585,10 +760,10 @@ function buildInboundCreateProperties(sourceRow, inboundMsg, propNames) {
     if (typ) props[col] = notionFromValueByType(typ, val);
   }
 
-  const kpSrc = sourceRow?.raw?.properties?.["KeyPerson ID"];
-  if (kpSrc?.type === "relation" && Array.isArray(kpSrc.relation) && kpSrc.relation.length) {
+  const kpTarget = String(keyPersonId || "").trim();
+  if (kpTarget) {
     const kt = getPropertyType(srcPage, "KeyPerson ID");
-    if (kt === "relation") props["KeyPerson ID"] = { relation: kpSrc.relation.map((x) => ({ id: x.id })).filter((x) => x.id) };
+    if (kt === "relation") props["KeyPerson ID"] = { relation: [{ id: kpTarget }] };
   }
 
   // Extra fields required by InteractionLOG inbound spec.
@@ -625,91 +800,87 @@ async function markReplyDone(cfg, row, detailText) {
 async function runInboundWatchOnce({ cfg, enqueueAndWait }) {
   const notionCfg = { token: cfg.notion.token, notionVersion: cfg.notion.notionVersion };
   const databaseId = cfg.notion.databaseId;
-  console.error("[executor][inbound] notion query", {
-    databaseId,
-    pageSize: Math.max(100, cfg.executor.pageSize),
-    sorts: [{ property: "Completion Time", direction: "descending" }],
-    where: "Platform=Email AND InNOut=Out AND OutReach Status=Success AND Action in (Send Email, Reply Email) AND Reply Status not in (Done, NO)",
-  });
-  const data = await queryDatabase(notionCfg, databaseId, {
-    pageSize: Math.max(100, cfg.executor.pageSize),
-    sorts: [{ property: "Completion Time", direction: "descending" }],
-  });
-  const pages = Array.isArray(data?.results) ? data.results : [];
-  const candidates = pages
+  const accountsPayload = await getAccountsPayload(cfg, enqueueAndWait, `inbound-${Date.now()}`);
+  const allowedSenders = listAllowedSenderEmails(accountsPayload);
+  const cacheState = loadInboundContactCache(cfg);
+  const successOutPages = await queryAllSuccessOutPages(notionCfg, databaseId, Math.max(100, cfg.executor.pageSize));
+  const successOutRows = successOutPages
     .map((p) => parseQueueRow(p))
     .filter((r) =>
       r.platform === "Email" &&
       r.inNOut === "Out" &&
       r.status === "Success" &&
-      (r.actionText === "Send Email" || r.actionText === "Reply Email") &&
-      r.replyStatus !== "Done" &&
-      r.replyStatus !== "NO"
+      (r.actionText === "Send Email" || r.actionText === "Reply Email")
     );
-  if (!candidates.length) {
-    console.error("[executor][inbound] no outbound candidates waiting for reply");
+  const cacheCandidates = buildOutboundCacheCandidates(successOutRows, allowedSenders);
+  let cacheInserted = 0;
+  for (const c of cacheCandidates) {
+    const key = buildInboundCacheKey(c.fcAccount, c.counterpartyEmail);
+    if (!cacheState.byKey.has(key)) {
+      cacheState.byKey.set(key, {
+        fcAccount: c.fcAccount,
+        counterpartyEmail: c.counterpartyEmail,
+        keyPersonId: c.keyPersonId,
+      });
+      cacheInserted += 1;
+    }
+  }
+  saveInboundContactCache(cacheState);
+  const templateRow = successOutRows.find((r) => r?.raw) || null;
+  if (!templateRow) {
+    console.error("[executor][inbound] no success out rows found for schema template");
     return;
   }
 
-  const inboundData = await queryInboundPages(notionCfg, databaseId, 100);
-  const inboundPages = Array.isArray(inboundData?.results) ? inboundData.results : [];
-  const existingInboundHeaderIds = collectInboundHeaderIds(inboundPages);
-  const accountsPayload = await getAccountsPayload(cfg, enqueueAndWait, `inbound-${Date.now()}`);
-  const allowedSenders = listAllowedSenderEmails(accountsPayload);
-  const localCandidates = candidates.filter((r) => r.fcAccount && allowedSenders.has(r.fcAccount));
+  const inboundPages = await queryAllInboundPages(notionCfg, databaseId, Math.max(100, cfg.executor.pageSize));
+  const existingInboundDedupKeys = collectInboundDedupKeys(inboundPages);
   console.error("[executor][inbound] scanning", {
-    outboundCandidates: candidates.length,
-    localOutboundCandidates: localCandidates.length,
-    skippedByFcAccountNotLocal: candidates.length - localCandidates.length,
-    existingInbound: existingInboundHeaderIds.size,
+    successOutRows: successOutRows.length,
+    cacheEntries: cacheState.byKey.size,
+    cacheInserted,
+    existingInbound: existingInboundDedupKeys.size,
+    loggedInFcAccounts: allowedSenders.size,
   });
 
-  const inboundCap = Math.max(1, Number(cfg?.executor?.maxInboundChecksPerCycle) || 5);
-  const toInspect = localCandidates.slice(0, inboundCap);
-  if (localCandidates.length > toInspect.length) {
-    console.error("[executor][inbound] max_inbound_checks_per_cycle cap", {
-      cap: inboundCap,
-      totalCandidates: localCandidates.length,
-      processingThisCycle: toInspect.length,
-      deferredToNextInboundPoll: localCandidates.length - toInspect.length,
-    });
-  }
-
-  for (const row of toInspect) {
-    const ctx = findAccountContextByEmail(accountsPayload, row.fcAccount);
-    if (!ctx) continue;
-    const accountObj = (accountsPayload.accounts || []).find((a) => a.accountId === ctx.accountId);
+  const inboundLimit = Math.max(100, Number(cfg?.executor?.inboundMessageLimit) || 2000);
+  for (const accountObj of accountsPayload.accounts || []) {
+    const localFcAccounts = (accountObj.identities || [])
+      .map((idn) => normalizeEmail(idn?.email))
+      .filter((x) => x && allowedSenders.has(x));
+    if (localFcAccounts.length === 0) continue;
     const inboxFolderId = findSpecialFolder(accountObj?.rootFolder, "inbox");
     if (!inboxFolderId) continue;
-
-    const partnerEmail = extractEmail(await resolveKeyPersonEmail(notionCfg, row) || row.counterpartyEmail);
-    const fromDate = row.completionTime instanceof Date ? row.completionTime : new Date(Date.now() - 60 * 60 * 1000);
+    const fromDateIso = cacheState.lastScanAtByAccount?.[accountObj.accountId] || "";
+    const fromDate = fromDateIso ? new Date(fromDateIso) : null;
+    const payload = {
+      accountId: accountObj.accountId,
+      folderId: inboxFolderId,
+      includeBody: true,
+      limit: inboundLimit,
+      messagesPerPage: 50,
+    };
+    if (fromDate instanceof Date && !isNaN(fromDate.valueOf())) {
+      payload.fromDate = fromDate.toISOString();
+    }
     const findRes = await enqueueAndWait({
-      request_id: `inbound-find-${row.taskId}-${Date.now()}`,
+      request_id: `inbound-find-${accountObj.accountId}-${Date.now()}`,
       action: "findMessages",
-      payload: {
-        accountId: ctx.accountId,
-        folderId: inboxFolderId,
-        fromDate: fromDate.toISOString(),
-        includeBody: true,
-        limit: 20,
-        messagesPerPage: 50,
-      },
+      payload,
     });
     console.error("[executor][inbound] findMessages query", {
-      taskId: row.taskId,
-      accountId: ctx.accountId,
+      accountId: accountObj.accountId,
       folderId: inboxFolderId,
-      fromDate: fromDate.toISOString(),
-      partnerEmail,
-      subjectAnchor: normalizeSubjectForMatch(row.subject),
-      limit: 20,
+      fromDate: fromDate instanceof Date ? fromDate.toISOString() : null,
+      fcAccounts: localFcAccounts,
+      limit: inboundLimit,
       messagesPerPage: 50,
     });
-    if (!findRes?.success) continue;
+    if (!findRes?.success) {
+      continue;
+    }
     const items = findRes?.result?.items || [];
     console.error("[executor][inbound] findMessages result", {
-      taskId: row.taskId,
+      accountId: accountObj.accountId,
       totalItems: items.length,
       sampleHeaders: items.slice(0, 3).map((m) => ({
         messageId: m.messageId,
@@ -719,45 +890,67 @@ async function runInboundWatchOnce({ cfg, enqueueAndWait }) {
         date: m.date,
       })),
     });
-    const target = items.find((m) => {
-      const authorEmail = extractEmail(m.author);
-      if (partnerEmail && authorEmail !== partnerEmail) return false;
-      if (existingInboundHeaderIds.has(String(m.headerMessageId || ""))) return false;
-      const subjOk = normalizeSubjectForMatch(m.subject) === normalizeSubjectForMatch(row.subject);
-      return subjOk;
-    });
-    if (!target) continue;
 
-    const metadataPayload = {
-      headerMessageId: target.headerMessageId || "",
-      conversationAnchor: row.payload?.conversationAnchor || row.payload?.headerMessageId || target.headerMessageId || "",
-      sourceOutPageId: row.pageId,
-      messageId: target.messageId,
-      to_email: row.fcAccount,
-      from_email: extractEmail(target.author),
-      subject: target.subject || row.subject,
-    };
-    const createProps = buildInboundCreateProperties(
-      row,
-      {
-        ...target,
-        subject: target.subject || row.subject,
-        replyText: target.body || "",
-        payload: metadataPayload,
-      },
-      cfg.executor?.notionPropertyNames
-    );
-    if (Object.keys(createProps).length === 0) continue;
-    await createPage(notionCfg, databaseId, createProps);
-    await markReplyDone(cfg, row, `inbound_reply_detected:${target.headerMessageId || target.messageId}`);
-    console.error("[executor][inbound] captured reply", {
-      outTaskId: row.taskId,
-      inboundHeaderMessageId: target.headerMessageId,
-      inboundMessageId: target.messageId,
-    });
-    existingInboundHeaderIds.add(String(target.headerMessageId || ""));
+    for (const target of items) {
+      const authorEmail = extractEmail(target.author);
+      if (!authorEmail) continue;
+      let matchedFc = "";
+      let matchedCache = null;
+      for (const fc of localFcAccounts) {
+        const key = buildInboundCacheKey(fc, authorEmail);
+        if (cacheState.byKey.has(key)) {
+          matchedFc = fc;
+          matchedCache = cacheState.byKey.get(key);
+          break;
+        }
+      }
+      if (!matchedFc || !matchedCache?.keyPersonId) continue;
+      const dedupKey = buildInboundDedupKey(matchedFc, target);
+      if (!dedupKey || existingInboundDedupKeys.has(dedupKey)) continue;
+
+      const matchedOut = findBestMatchingOutRow(successOutRows, matchedFc, authorEmail, target.subject || "");
+      const metadataPayload = {
+        headerMessageId: target.headerMessageId || "",
+        conversationAnchor: matchedOut?.payload?.conversationAnchor || matchedOut?.payload?.headerMessageId || target.headerMessageId || "",
+        sourceOutPageId: matchedOut?.pageId || "",
+        messageId: target.messageId,
+        to_email: matchedFc,
+        from_email: authorEmail,
+        subject: target.subject || matchedOut?.subject || "",
+        cacheMatched: true,
+        keyPersonId: matchedCache.keyPersonId,
+      };
+      const createProps = buildInboundCreateProperties(
+        matchedOut || templateRow,
+        {
+          ...target,
+          subject: target.subject || matchedOut?.subject || "",
+          replyText: target.body || "",
+          payload: metadataPayload,
+        },
+        cfg.executor?.notionPropertyNames,
+        matchedCache.keyPersonId
+      );
+      if (Object.keys(createProps).length === 0) continue;
+      await createPage(notionCfg, databaseId, createProps);
+      if (matchedOut) {
+        await markReplyDone(cfg, matchedOut, `inbound_reply_detected:${target.headerMessageId || target.messageId}`);
+      }
+      existingInboundDedupKeys.add(dedupKey);
+      console.error("[executor][inbound] captured inbound", {
+        outTaskId: matchedOut?.taskId || "",
+        inboundHeaderMessageId: target.headerMessageId,
+        inboundMessageId: target.messageId,
+        fcAccount: matchedFc,
+        keyPersonId: matchedCache.keyPersonId,
+      });
+    }
+
+    cacheState.lastScanAtByAccount[accountObj.accountId] = nowIso();
+    saveInboundContactCache(cacheState);
   }
 }
+
 
 async function executeOne({ cfg, enqueueAndWait }, row) {
   const notionCfg = { token: cfg.notion.token, notionVersion: cfg.notion.notionVersion };

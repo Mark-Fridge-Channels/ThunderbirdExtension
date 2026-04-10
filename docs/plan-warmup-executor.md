@@ -2,6 +2,15 @@
 
 **Overall Progress:** `100%`
 
+## Inbound Cache Backfill（2026-04）
+
+**Progress:** `100%`
+
+- [x] 🟩 **Step 1（25%）缓存模型落地**：新增永久 JSON 缓存（`inbound-contact-cache.json`），结构固定为 `FCAccount + counterpartyEmail + keyPersonId`，并保留 `lastScanAtByAccount` 作为按账号增量扫描水位。
+- [x] 🟩 **Step 2（50%）Success Out 全量回填缓存**：入站轮询先全量查询 `OutReach Status=Success` 的 `Send Email/Reply Email`，仅处理已登录账号，且 `KeyPerson ID` 为空时不入缓存；重复键按首次写入优先（first-write wins）。
+- [x] 🟩 **Step 3（75%）监听改为缓存驱动**：按账号扫描 Inbox，命中缓存即写 `InNOut=In / Action=Inbound Reply`；即使匹配不到具体 Out 任务也可落库；若能匹配到 Out 再补充 `markReplyDone`。
+- [x] 🟩 **Step 4（100%）去重与可降级规则**：去重键改为 `FCAccount + headerMessageId`，当 `headerMessageId` 缺失时自动降级到 `FCAccount + messageId`。
+
 ## InteractionLOG schema alignment（2026-04）
 
 - [x] 🟩 **OutReach Status**：通过 `executor.notion_property_names.Status` 映射写回；解析支持 `OutReach Status` / `Status` 别名。
