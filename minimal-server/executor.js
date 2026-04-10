@@ -429,9 +429,10 @@ async function queryAllInboundPages(notionCfg, databaseId, pageSize) {
   return out;
 }
 
-async function queryAllSuccessOutPages(notionCfg, databaseId, pageSize) {
+async function queryAllSuccessOutPages(notionCfg, databaseId, pageSize, outreachStatusProp) {
   const out = [];
   let cursor = undefined;
+  const statusCol = String(outreachStatusProp || "OutReach Status").trim() || "OutReach Status";
   const filter = {
     and: [
       { property: "Platform", select: { equals: "Email" } },
@@ -442,12 +443,8 @@ async function queryAllSuccessOutPages(notionCfg, databaseId, pageSize) {
           { property: "Action", select: { equals: "Reply Email" } },
         ],
       },
-      {
-        or: [
-          { property: "OutReach Status", status: { equals: "Success" } },
-          { property: "OutReach Status", select: { equals: "Success" } },
-        ],
-      },
+      // Notion "Status" column type — must use `status` filter, never `select`.
+      { property: statusCol, status: { equals: "Success" } },
     ],
   };
   const sorts = [{ property: "Completion Time", direction: "ascending" }];
@@ -609,8 +606,18 @@ function buildFcAccountFilter(localSenders, kind) {
   return null;
 }
 
-async function queryOutboundCandidatePages({ notionCfg, databaseId, pageSize, maxScanRows, lowerBound, upperBound, localSenders = [] }) {
+async function queryOutboundCandidatePages({
+  notionCfg,
+  databaseId,
+  pageSize,
+  maxScanRows,
+  lowerBound,
+  upperBound,
+  localSenders = [],
+  outreachStatusProp,
+}) {
   const sorts = [{ property: "Trigger Time", direction: "ascending" }];
+  const statusCol = String(outreachStatusProp || "OutReach Status").trim() || "OutReach Status";
   const baseClauses = [
     { property: "Platform", select: { equals: "Email" } },
     { property: "InNOut", select: { equals: "Out" } },
@@ -625,12 +632,8 @@ async function queryOutboundCandidatePages({ notionCfg, databaseId, pageSize, ma
   ];
   const filterPlans = [
     {
-      name: "status_filter=status",
-      filter: { and: [...baseClauses, { property: "OutReach Status", status: { equals: "Todo" } }] },
-    },
-    {
-      name: "status_filter=select",
-      filter: { and: [...baseClauses, { property: "OutReach Status", select: { equals: "Todo" } }] },
+      name: "outreach_status=status(Todo)",
+      filter: { and: [...baseClauses, { property: statusCol, status: { equals: "Todo" } }] },
     },
     {
       name: "status_filter=none",
@@ -654,12 +657,8 @@ async function queryOutboundCandidatePages({ notionCfg, databaseId, pageSize, ma
     const fc = buildFcAccountFilter(localSenders, k);
     if (!fc) continue;
     fcPlans.push({
-      name: `status_filter=status,fc_filter=${k}`,
-      filter: { and: [...baseClauses, { property: "OutReach Status", status: { equals: "Todo" } }, fc] },
-    });
-    fcPlans.push({
-      name: `status_filter=select,fc_filter=${k}`,
-      filter: { and: [...baseClauses, { property: "OutReach Status", select: { equals: "Todo" } }, fc] },
+      name: `outreach_status=status(Todo),fc_filter=${k}`,
+      filter: { and: [...baseClauses, { property: statusCol, status: { equals: "Todo" } }, fc] },
     });
     fcPlans.push({
       name: `status_filter=none,fc_filter=${k}`,
@@ -800,10 +799,16 @@ async function markReplyDone(cfg, row, detailText) {
 async function runInboundWatchOnce({ cfg, enqueueAndWait }) {
   const notionCfg = { token: cfg.notion.token, notionVersion: cfg.notion.notionVersion };
   const databaseId = cfg.notion.databaseId;
+  const outreachStatusCol = cfg.executor?.notionPropertyNames?.Status || "OutReach Status";
   const accountsPayload = await getAccountsPayload(cfg, enqueueAndWait, `inbound-${Date.now()}`);
   const allowedSenders = listAllowedSenderEmails(accountsPayload);
   const cacheState = loadInboundContactCache(cfg);
-  const successOutPages = await queryAllSuccessOutPages(notionCfg, databaseId, Math.max(100, cfg.executor.pageSize));
+  const successOutPages = await queryAllSuccessOutPages(
+    notionCfg,
+    databaseId,
+    Math.max(100, cfg.executor.pageSize),
+    outreachStatusCol
+  );
   const successOutRows = successOutPages
     .map((p) => parseQueueRow(p))
     .filter((r) =>
@@ -1291,6 +1296,7 @@ async function runOnce({ cfg, enqueueAndWait }) {
       "Trigger Time in [now-lookback, now+horizon] (Notion coarse filter) AND local eligibility checks: Platform=Email, InNOut=Out, OutReach Status=Todo, Action in (Send Email, Reply Email), FCAccount in local identities",
   });
   let results = [];
+  const outreachStatusCol = cfg.executor?.notionPropertyNames?.Status || "OutReach Status";
   try {
     const queryRes = await queryOutboundCandidatePages({
       notionCfg,
@@ -1300,6 +1306,7 @@ async function runOnce({ cfg, enqueueAndWait }) {
       lowerBound,
       upperBound,
       localSenders: Array.from(allowedSenders),
+      outreachStatusProp: outreachStatusCol,
     });
     results = queryRes.items;
     console.error("[executor][outbound] notion filter plan selected", {
