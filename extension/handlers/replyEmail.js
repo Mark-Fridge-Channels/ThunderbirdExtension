@@ -87,15 +87,9 @@ export async function handleReplyEmail({ payload }) {
     }
     const normalized = normalizeSendResult(afterSend?.mode ? afterSend : result);
     if (normalized.mode !== "sendLater" && !normalized.headerMessageId) {
-      return {
-        success: false,
-        error: makeError(CODES.API_ERROR, "Missing headerMessageId after send", {
-          phase: "onAfterSend",
-          mode: normalized.mode,
-          sendInfo: afterSend,
-          sendMessageResult: normalizeSendResult(result),
-        }),
-      };
+      // Thunderbird may complete SMTP send successfully but still omit headerMessageId.
+      // Treat as success to avoid false-negative writeback; keep warning for observability.
+      normalized.warnings = ["headerMessageId_missing_after_send"];
     }
     return { success: true, result: normalized };
   } catch (e) {
