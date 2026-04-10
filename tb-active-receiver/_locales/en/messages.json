@@ -16,7 +16,7 @@
   "optPollAll": { "message": "On each tick: fetch all accounts (all-accounts check mail)" },
   "optMonitorAllFolders": { "message": "Listen for new mail in all folders" },
   "optSettleMs": { "message": "Wait after fetch before Inbox tab fallback (ms)" },
-  "optReportUrl": { "message": "Report URL (POST JSON, empty to disable)" },
+  "optReportUrl": { "message": "Report URL (POST JSON; empty uses built-in http://127.0.0.1:3939/...)" },
   "optReportIncludeBody": {
     "message": "Include plain + HTML body in report (minimal-server webhook / Notion)"
   },

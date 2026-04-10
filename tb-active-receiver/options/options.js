@@ -1,3 +1,5 @@
+import { effectiveReportUrl } from "../lib/constants.js";
+
 const browser = globalThis.browser ?? globalThis.messenger;
 
 function t(id) {
@@ -36,7 +38,7 @@ async function load() {
   document.getElementById("pollMinutes").value = String(o.pollIntervalMinutes ?? 1);
   document.getElementById("pollAll").checked = o.pollAllAccounts !== false;
   document.getElementById("monitorAllFolders").checked = o.monitorAllFolders !== false;
-  document.getElementById("reportUrl").value = o.reportUrl ?? "";
+  document.getElementById("reportUrl").value = effectiveReportUrl(o.reportUrl);
   document.getElementById("reportIncludeBody").checked = o.reportIncludeBody !== false;
   document.getElementById("reportSecret").value = o.reportSecret ?? "";
   document.getElementById("mailTabFallback").checked = !!o.useMailTabFallback;
@@ -47,12 +49,10 @@ async function save() {
   const status = document.getElementById("status");
   status.textContent = "";
 
-  const reportUrl = document.getElementById("reportUrl").value.trim();
-  if (reportUrl) {
-    const ok = await requestOriginsForUrl(reportUrl);
-    if (!ok) {
-      status.textContent = t("optPermissionDenied");
-    }
+  const reportUrl = effectiveReportUrl(document.getElementById("reportUrl").value);
+  const okPerm = await requestOriginsForUrl(reportUrl);
+  if (!okPerm) {
+    status.textContent = t("optPermissionDenied");
   }
 
   const pollIntervalMinutes = Math.max(
@@ -84,7 +84,7 @@ async function save() {
   });
 
   await browser.runtime.sendMessage({ type: "tbActiveRx.reloadSettings" });
-  status.textContent = t("optSave") + " — OK";
+  status.textContent = okPerm ? t("optSave") + " — OK" : t("optSave") + " — " + t("optPermissionDenied");
 }
 
 applyI18n();

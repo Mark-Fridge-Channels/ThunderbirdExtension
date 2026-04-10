@@ -2,6 +2,8 @@
  * Options, persisted account ledger (last fetch / new mail), and getStatus() payload.
  */
 
+import { effectiveReportUrl } from "./constants.js";
+
 const browser = globalThis.browser ?? globalThis.messenger;
 
 const K = {
@@ -16,6 +18,7 @@ const DEFAULT_OPTIONS = {
   pollIntervalMinutes: 1,
   pollAllAccounts: true,
   monitorAllFolders: true,
+  /** Persisted override; empty means use built-in default (see loadOptions). */
   reportUrl: "",
   /** When true (default), decode message bodies for webhook (plain + HTML). */
   reportIncludeBody: true,
@@ -29,12 +32,16 @@ const DEFAULT_OPTIONS = {
 export async function loadOptions() {
   const { [K.options]: raw } = await browser.storage.local.get(K.options);
   const o = raw && typeof raw === "object" ? raw : {};
-  return { ...DEFAULT_OPTIONS, ...o };
+  const merged = { ...DEFAULT_OPTIONS, ...o };
+  merged.reportUrl = effectiveReportUrl(merged.reportUrl);
+  return merged;
 }
 
 export async function saveOptions(partial) {
-  const cur = await loadOptions();
-  const next = { ...cur, ...partial };
+  const { [K.options]: raw } = await browser.storage.local.get(K.options);
+  const o = raw && typeof raw === "object" ? raw : {};
+  const next = { ...DEFAULT_OPTIONS, ...o, ...partial };
+  next.reportUrl = effectiveReportUrl(next.reportUrl);
   await browser.storage.local.set({ [K.options]: next });
   return next;
 }
