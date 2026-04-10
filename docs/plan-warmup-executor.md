@@ -11,6 +11,24 @@
 - [x] 🟩 **Step 3（75%）监听改为缓存驱动**：按账号扫描 Inbox，命中缓存即写 `InNOut=In / Action=Inbound Reply`；即使匹配不到具体 Out 任务也可落库；若能匹配到 Out 再补充 `markReplyDone`。
 - [x] 🟩 **Step 4（100%）去重与可降级规则**：去重键改为 `FCAccount + headerMessageId`，当 `headerMessageId` 缺失时自动降级到 `FCAccount + messageId`。
 
+## TB Active Receiver Webhook + 正文上报（2026-04）
+
+**Progress:** `100%`
+
+- [x] 🟩 **Step 1（20%）`tb-active-receiver`**：`schemaVersion`+`type` 契约、`fcAccount`（默认身份邮箱）、`bodyPlain`/`bodyHtml`、`hasAttachments`；可选 `X-TB-Receiver-Secret`；选项「包含正文」与密钥。
+- [x] 🟩 **Step 2（40%）`minimal-server`**：`POST /tb-active-receiver/report`（可配置路径）、大体积 JSON 上限、`handleTbActiveReceiverWebhook` 按联系人缓存过滤后 `createPage`。
+- [x] 🟩 **Step 3（60%）去重文件**：`inbound-dedupe-keys.json` 与 executor 入站轮询共用，避免 webhook 与轮询双写。
+- [x] 🟩 **Step 4（80%）OutReach Status**：查询模板行仅用 Notion `status` filter（与库类型一致）。
+- [x] 🟩 **Step 5（100%）配置与文档**：`config.example.json`、启动日志、`plan-warmup-executor` 本节。
+
+## TB-first inbound：关 findMessages 轮询 + 发信写缓存（2026-04）
+
+**Progress:** `100%`
+
+- [x] 🟩 **Step 1（33%）配置生效**：`config.js` 读取 `executor.enable_outbound` / `executor.enable_inbound`（可与 `EXECUTOR_*` 环境变量叠加）；示例默认 `enable_inbound: false`（入站依赖 TB Active Receiver webhook）。
+- [x] 🟩 **Step 2（66%）发信回填缓存**：`successWriteback` 成功后按 `fcAccount` + 收件人邮箱（`partnerEmail` / `counterpartyEmail` / `payload.to`）写入 `inbound-contact-cache.json`，已有键不覆盖（first-write wins）；失败只打日志不影响回写。
+- [x] 🟩 **Step 3（100%）外发 Reply Status**：成功回写不再把外发行的 `Reply Status` 置为 `Todo`（与「不靠 reply 状态驱动监听」一致）；入站轮询仍可在开启时 `markReplyDone`。
+
 ## InteractionLOG schema alignment（2026-04）
 
 - [x] 🟩 **OutReach Status**：通过 `executor.notion_property_names.Status` 映射写回；解析支持 `OutReach Status` / `Status` 别名。

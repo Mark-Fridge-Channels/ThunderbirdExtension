@@ -17,6 +17,12 @@
   "optMonitorAllFolders": { "message": "Listen for new mail in all folders" },
   "optSettleMs": { "message": "Wait after fetch before Inbox tab fallback (ms)" },
   "optReportUrl": { "message": "Report URL (POST JSON, empty to disable)" },
+  "optReportIncludeBody": {
+    "message": "Include plain + HTML body in report (minimal-server webhook / Notion)"
+  },
+  "optReportSecret": {
+    "message": "Webhook shared secret (optional; sent as X-TB-Receiver-Secret)"
+  },
   "optMailTabFallback": { "message": "If no new-mail event after fetch: switch mail tab to each Inbox" },
   "optSave": { "message": "Save" },
   "optPermissionDenied": { "message": "Origin permission not granted; report may fail until allowed." },

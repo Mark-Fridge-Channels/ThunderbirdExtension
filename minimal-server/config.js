@@ -64,6 +64,7 @@ function loadConfig() {
 
   const notion = cfg?.notion ?? {};
   const executor = cfg?.executor ?? {};
+  const loggingRaw = cfg?.logging ?? {};
 
   const defaultPropNames = {
     Status: "Status",
@@ -98,8 +99,8 @@ function loadConfig() {
     executor: {
       enabled: asBoolean(process.env.EXECUTOR_ENABLED ?? executor.enabled, true),
       mode,
-      enableOutbound: asBoolean(process.env.EXECUTOR_ENABLE_OUTBOUND, modeEnableOutbound),
-      enableInbound: asBoolean(process.env.EXECUTOR_ENABLE_INBOUND, modeEnableInbound),
+      enableOutbound: asBoolean(process.env.EXECUTOR_ENABLE_OUTBOUND ?? executor.enable_outbound, modeEnableOutbound),
+      enableInbound: asBoolean(process.env.EXECUTOR_ENABLE_INBOUND ?? executor.enable_inbound, modeEnableInbound),
       pollIntervalMs: asPositiveInt(executor.poll_interval_ms, 60000),
       pageSize: Math.min(100, Math.max(1, asPositiveInt(executor.page_size, 20))),
       maxScanRows: Math.min(2000, Math.max(20, asPositiveInt(executor.max_scan_rows, 200))),
@@ -145,8 +146,33 @@ function loadConfig() {
         typeof executor.inbound_contact_cache_path === "string" && executor.inbound_contact_cache_path.trim()
           ? executor.inbound_contact_cache_path.trim()
           : "inbound-contact-cache.json",
+      inboundDedupePath:
+        typeof executor.inbound_dedupe_path === "string" && executor.inbound_dedupe_path.trim()
+          ? executor.inbound_dedupe_path.trim()
+          : "inbound-dedupe-keys.json",
+      /** POST path for TB Active Receiver JSON reports (127.0.0.1 only). */
+      tbReceiverReportPath:
+        typeof executor.tb_receiver_report_path === "string" && executor.tb_receiver_report_path.trim()
+          ? executor.tb_receiver_report_path.trim()
+          : "/tb-active-receiver/report",
+      /** If non-empty, require matching `X-TB-Receiver-Secret` header on webhook POST. */
+      tbReceiverWebhookSecret:
+        typeof executor.tb_receiver_webhook_secret === "string" ? executor.tb_receiver_webhook_secret.trim() : "",
+      /** Max JSON body size for TB receiver webhook (large mail bodies). */
+      tbReportMaxBodyBytes: Math.min(
+        200 * 1024 * 1024,
+        Math.max(1024 * 1024, asPositiveInt(executor.tb_report_max_body_bytes, 100 * 1024 * 1024))
+      ),
       addressBookId: typeof executor.address_book_id === "string" ? executor.address_book_id.trim() : "",
       notionPropertyNames,
+    },
+    logging: {
+      enabled: asBoolean(loggingRaw.enabled, true),
+      directory:
+        typeof loggingRaw.directory === "string" && loggingRaw.directory.trim()
+          ? loggingRaw.directory.trim()
+          : "log",
+      mirrorConsole: asBoolean(loggingRaw.mirror_console, true),
     },
   };
 
@@ -177,7 +203,14 @@ function printConfigSummary(cfg) {
   console.error("  executor.max_inbound_checks_per_cycle =", cfg.executor.maxInboundChecksPerCycle);
   console.error("  executor.inbound_message_limit =", cfg.executor.inboundMessageLimit);
   console.error("  executor.inbound_contact_cache_path =", cfg.executor.inboundContactCachePath);
+  console.error("  executor.inbound_dedupe_path =", cfg.executor.inboundDedupePath);
+  console.error("  executor.tb_receiver_report_path =", cfg.executor.tbReceiverReportPath);
+  console.error("  executor.tb_receiver_webhook_secret =", cfg.executor.tbReceiverWebhookSecret ? "(set)" : "(empty)");
+  console.error("  executor.tb_report_max_body_bytes =", cfg.executor.tbReportMaxBodyBytes);
   console.error("  executor.address_book_id =", cfg.executor.addressBookId ? cfg.executor.addressBookId : "(empty)");
+  console.error("  logging.enabled =", cfg.logging.enabled);
+  console.error("  logging.directory =", cfg.logging.directory);
+  console.error("  logging.mirror_console =", cfg.logging.mirrorConsole);
 }
 
 module.exports = { loadConfig, printConfigSummary };

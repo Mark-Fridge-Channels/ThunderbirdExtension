@@ -1,8 +1,10 @@
 /**
  * messages.onNewMailReceived: reply heuristics + optional HTTP report + lastNewMailAt.
+ * Report JSON includes schemaVersion, plain+HTML bodies (optional), and fcAccount for minimal-server webhook.
  */
 
 import * as state from "./state.js";
+import { extractBodyFromMessagePart } from "./messageBody.js";
 
 const browser = globalThis.browser ?? globalThis.messenger;
 
@@ -55,12 +57,44 @@ async function loadTrackedIds() {
   return new Set(list.map((x) => String(x).trim()).filter(Boolean));
 }
 
-async function postReport(url, body) {
+/** Default identity email for this mail account (normalized lowercase). Used as FCAccount on the server. */
+async function resolveDefaultIdentityEmail(accountId) {
+  if (!accountId) return "";
+  try {
+    const acc = await browser.accounts.get(accountId);
+    const identities = Array.isArray(acc?.identities) ? acc.identities : [];
+    let preferred = null;
+    if (acc.defaultIdentityId) {
+      preferred = identities.find((i) => i && i.id === acc.defaultIdentityId);
+    }
+    if (!preferred) {
+      preferred = identities.find((i) => i && i.default) || identities[0];
+    }
+    const em = preferred?.email ? String(preferred.email).trim().toLowerCase() : "";
+    return em;
+  } catch (_) {
+    return "";
+  }
+}
+
+async function messageHasAttachments(messageId) {
+  try {
+    const m = await browser.messages.get(messageId);
+    return Array.isArray(m?.attachments) && m.attachments.length > 0;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function postReport(url, body, secret) {
   if (!url) return;
   try {
+    const headers = { "Content-Type": "application/json" };
+    const s = String(secret || "").trim();
+    if (s) headers["X-TB-Receiver-Secret"] = s;
     const r = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify(body),
     });
     if (!r.ok) {
@@ -74,6 +108,7 @@ async function postReport(url, body) {
 export async function handleNewMailFolderBatch(folder, messages) {
   const options = await state.loadOptions();
   const reportUrl = options.reportUrl ? String(options.reportUrl).trim() : "";
+  const includeBody = options.reportIncludeBody !== false;
 
   await browser.storage.session.set({ tbActiveReceiverRoundHadNewMail: true });
 
@@ -83,14 +118,22 @@ export async function handleNewMailFolderBatch(folder, messages) {
     if (!header?.id) continue;
     let inReplyTo = "";
     let references = "";
+    let bodyPlain = "";
+    let bodyHtml = "";
+
     try {
-      const full = await browser.messages.getFull(header.id, { decodeContent: false });
+      const full = await browser.messages.getFull(header.id, { decodeContent: includeBody });
       const merged = {};
       collectHeadersFromFull(full, merged);
       inReplyTo = headerValue(merged, "in-reply-to");
       references = headerValue(merged, "references");
+      if (includeBody) {
+        const extracted = extractBodyFromMessagePart(full);
+        bodyPlain = extracted.plain || "";
+        bodyHtml = extracted.htmlFallback || "";
+      }
     } catch (_) {
-      /* header-only path */
+      /* header/body unavailable */
     }
 
     const { isReply, reason } = replyHeuristic({
@@ -106,19 +149,34 @@ export async function handleNewMailFolderBatch(folder, messages) {
     }
 
     if (reportUrl) {
-      await postReport(reportUrl, {
+      const fcAccount = await resolveDefaultIdentityEmail(accountId);
+      if (!fcAccount) {
+        console.warn("[TB Active Receiver] skip report: no identity email for account", accountId);
+        continue;
+      }
+      const hasAttachments = await messageHasAttachments(header.id);
+      await postReport(
+        reportUrl,
+        {
+        schemaVersion: 1,
         type: "tb-active-receiver.newMail",
         receivedAt: new Date().toISOString(),
+        fcAccount,
         accountId,
         folderId: folder?.id ?? header.folder?.id ?? null,
         messageId: header.id,
         headerMessageId: header.headerMessageId ?? null,
         author: header.author ?? "",
         subject: header.subject ?? "",
+        bodyPlain,
+        bodyHtml,
+        hasAttachments,
         isReplyHint: isReply,
         replyHintReason: reason,
         inReplyTo: inReplyTo || null,
-      });
+        },
+        options.reportSecret
+      );
     }
   }
 }

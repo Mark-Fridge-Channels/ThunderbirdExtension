@@ -46,7 +46,15 @@
     <input type="number" id="settleMs" min="500" max="120000" step="100" />
 
     <label for="reportUrl" data-i18n="optReportUrl">Report URL</label>
-    <input type="text" id="reportUrl" placeholder="https://example.com/hook" autocomplete="off" />
+    <input type="text" id="reportUrl" placeholder="http://127.0.0.1:3939/tb-active-receiver/report" autocomplete="off" />
+
+    <label
+      ><input type="checkbox" id="reportIncludeBody" />
+      <span data-i18n="optReportIncludeBody">Include plain + HTML body in report (for Notion)</span></label
+    >
+
+    <label for="reportSecret" data-i18n="optReportSecret">Webhook secret (optional, X-TB-Receiver-Secret)</label>
+    <input type="password" id="reportSecret" autocomplete="off" />
 
     <label
       ><input type="checkbox" id="mailTabFallback" />

@@ -17,6 +17,10 @@ const DEFAULT_OPTIONS = {
   pollAllAccounts: true,
   monitorAllFolders: true,
   reportUrl: "",
+  /** When true (default), decode message bodies for webhook (plain + HTML). */
+  reportIncludeBody: true,
+  /** Sent as X-TB-Receiver-Secret when non-empty (must match minimal-server tb_receiver_webhook_secret). */
+  reportSecret: "",
   useMailTabFallback: false,
   settleAfterFetchMs: 3000,
   pollingDisabledAccountIds: [],

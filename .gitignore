@@ -1,4 +1,7 @@
 minimal-server/config.json
+minimal-server/log/
+minimal-server/inbound-contact-cache.json
+minimal-server/inbound-dedupe-keys.json
 extension-*
 tb-active-receiver-*
 extension.xpi

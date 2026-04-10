@@ -37,6 +37,8 @@ async function load() {
   document.getElementById("pollAll").checked = o.pollAllAccounts !== false;
   document.getElementById("monitorAllFolders").checked = o.monitorAllFolders !== false;
   document.getElementById("reportUrl").value = o.reportUrl ?? "";
+  document.getElementById("reportIncludeBody").checked = o.reportIncludeBody !== false;
+  document.getElementById("reportSecret").value = o.reportSecret ?? "";
   document.getElementById("mailTabFallback").checked = !!o.useMailTabFallback;
   document.getElementById("settleMs").value = String(o.settleAfterFetchMs ?? 3000);
 }
@@ -74,6 +76,8 @@ async function save() {
       pollAllAccounts: document.getElementById("pollAll").checked,
       monitorAllFolders: document.getElementById("monitorAllFolders").checked,
       reportUrl,
+      reportIncludeBody: document.getElementById("reportIncludeBody").checked,
+      reportSecret: document.getElementById("reportSecret").value.trim(),
       useMailTabFallback: document.getElementById("mailTabFallback").checked,
       settleAfterFetchMs,
     },

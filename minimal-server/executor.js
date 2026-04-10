@@ -13,6 +13,7 @@
 
 const { queryDatabase, updatePage, createPage, getPage } = require("./notion.js");
 const { parseQueueRow, isWithinWindow, computeExternalEventId, readSelectName, readEmailValue } = require("./queueParser.js");
+const { mergeDedupeKeysInto, hasDedupeKey, addDedupeKey } = require("./inboundDedupe.js");
 const fs = require("fs");
 const path = require("path");
 
@@ -406,6 +407,109 @@ function saveInboundContactCache(state) {
   const dir = path.dirname(state.path);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(state.path, JSON.stringify(payload, null, 2), "utf8");
+}
+
+/** Emails we may receive replies from (TB Active Receiver matches author to these). */
+function collectOutboundRecipientEmailsForCache(row, partnerEmailResolved) {
+  const out = new Set();
+  const add = (v) => {
+    const n = normalizeEmail(v);
+    if (n) out.add(n);
+  };
+  add(partnerEmailResolved);
+  add(row?.counterpartyEmail);
+  const p = row?.payload;
+  if (p && Array.isArray(p.to)) for (const x of p.to) add(x);
+  else if (p && typeof p.to === "string") add(p.to);
+  add(p?.to_email);
+  return [...out];
+}
+
+/**
+ * Merge one (fcAccount, counterpartyEmail, keyPersonId) into the JSON cache if missing.
+ * Fresh read/write so webhook (`readContactCacheMapFresh`) sees updates; clears in-memory cache.
+ */
+function appendInboundCacheEntriesFromSendSuccess(cfg, row, partnerEmailResolved) {
+  const fc = normalizeEmail(row?.fcAccount);
+  const kp = String(row?.keyPersonPageId || "").trim();
+  if (!fc || !kp) return;
+  if (row?.inNOut !== "Out") return;
+  if (row?.actionText !== "Send Email" && row?.actionText !== "Reply Email") return;
+
+  const recipients = collectOutboundRecipientEmailsForCache(row, partnerEmailResolved);
+  if (recipients.length === 0) return;
+
+  const cachePath = getInboundCachePath(cfg);
+  let parsed = null;
+  try {
+    const raw = fs.readFileSync(cachePath, "utf8");
+    parsed = safeJsonParse(raw, null);
+  } catch (_) {
+    parsed = null;
+  }
+  const byKey = new Map();
+  for (const e of Array.isArray(parsed?.entries) ? parsed.entries : []) {
+    const f = normalizeEmail(e?.fcAccount);
+    const c = normalizeEmail(e?.counterpartyEmail);
+    const kid = String(e?.keyPersonId || "").trim();
+    if (!f || !c || !kid) continue;
+    const k = buildInboundCacheKey(f, c);
+    if (!byKey.has(k)) byKey.set(k, { fcAccount: f, counterpartyEmail: c, keyPersonId: kid });
+  }
+
+  let added = 0;
+  for (const cp of recipients) {
+    const key = buildInboundCacheKey(fc, cp);
+    if (byKey.has(key)) continue;
+    byKey.set(key, { fcAccount: fc, counterpartyEmail: cp, keyPersonId: kp });
+    added += 1;
+  }
+  if (added === 0) return;
+
+  const payload = {
+    version: 1,
+    updatedAt: nowIso(),
+    entries: Array.from(byKey.values()),
+    lastScanAtByAccount:
+      parsed?.lastScanAtByAccount && typeof parsed.lastScanAtByAccount === "object"
+        ? { ...parsed.lastScanAtByAccount }
+        : {},
+  };
+  const dir = path.dirname(cachePath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(cachePath, JSON.stringify(payload, null, 2), "utf8");
+  inboundContactCacheState = null;
+  console.error("[executor] inbound contact cache updated after send", { fcAccount: fc, added, totalKeys: byKey.size });
+}
+
+/** Read contact cache JSON from disk (fresh read for webhook; does not use in-memory cache). */
+function readContactCacheMapFresh(cfg) {
+  const cachePath = getInboundCachePath(cfg);
+  const byKey = new Map();
+  try {
+    const raw = fs.readFileSync(cachePath, "utf8");
+    const parsed = JSON.parse(raw);
+    for (const e of Array.isArray(parsed?.entries) ? parsed.entries : []) {
+      const fc = normalizeEmail(e?.fcAccount);
+      const cp = normalizeEmail(e?.counterpartyEmail);
+      const kp = String(e?.keyPersonId || "").trim();
+      if (!fc || !cp || !kp) continue;
+      const k = buildInboundCacheKey(fc, cp);
+      if (!byKey.has(k)) byKey.set(k, { keyPersonId: kp, fcAccount: fc, counterpartyEmail: cp });
+    }
+  } catch (_) {
+    /* missing file or invalid JSON → empty map */
+  }
+  return byKey;
+}
+
+function stripHtmlToPlain(s) {
+  return String(s || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function dedupeIdForInboundMessage(msg) {
@@ -839,6 +943,7 @@ async function runInboundWatchOnce({ cfg, enqueueAndWait }) {
 
   const inboundPages = await queryAllInboundPages(notionCfg, databaseId, Math.max(100, cfg.executor.pageSize));
   const existingInboundDedupKeys = collectInboundDedupKeys(inboundPages);
+  mergeDedupeKeysInto(cfg, existingInboundDedupKeys);
   console.error("[executor][inbound] scanning", {
     successOutRows: successOutRows.length,
     cacheEntries: cacheState.byKey.size,
@@ -942,6 +1047,7 @@ async function runInboundWatchOnce({ cfg, enqueueAndWait }) {
         await markReplyDone(cfg, matchedOut, `inbound_reply_detected:${target.headerMessageId || target.messageId}`);
       }
       existingInboundDedupKeys.add(dedupKey);
+      addDedupeKey(cfg, dedupKey);
       console.error("[executor][inbound] captured inbound", {
         outTaskId: matchedOut?.taskId || "",
         inboundHeaderMessageId: target.headerMessageId,
@@ -1140,6 +1246,7 @@ async function executeOne({ cfg, enqueueAndWait }, row) {
     detail: successDetail,
     externalEventId,
     payloadText: JSON.stringify(minimalPayload),
+    partnerEmailResolved: resolvedPartnerEmail,
   });
 }
 
@@ -1191,7 +1298,7 @@ function mapActionToEnvelope({ row, externalEventId, accountId, identityId, requ
   return { ok: false, reason: "unsupported_action" };
 }
 
-async function successWriteback({ cfg, row, detail, externalEventId, payloadText }) {
+async function successWriteback({ cfg, row, detail, externalEventId, payloadText, partnerEmailResolved }) {
   const notionCfg = { token: cfg.notion.token, notionVersion: cfg.notion.notionVersion };
   const propNames = cfg.executor?.notionPropertyNames;
   const props = buildWritebackProperties({
@@ -1201,20 +1308,16 @@ async function successWriteback({ cfg, row, detail, externalEventId, payloadText
     externalEventId,
     payloadText,
   }, propNames);
-  const replyName = propNames?.reply_status || "Reply Status";
-  const replyType = getPropertyType(row.raw, replyName);
-  if (row?.inNOut === "Out" && (row?.actionText === "Send Email" || row?.actionText === "Reply Email")) {
-    const current = String(row?.replyStatus || "").trim();
-    if (!current || current === "Todo" || current === "Progress") {
-      if (replyType === "status") props[replyName] = notionStatus("Todo");
-      else if (replyType === "select") props[replyName] = notionSelect("Todo");
-    }
-  }
   try {
     await updatePage(notionCfg, row.pageId, props);
   } catch (e) {
     console.error("[executor] writeback failed (success)", { taskId: row.taskId, pageId: row.pageId, error: e?.message ?? e });
     throw e;
+  }
+  try {
+    appendInboundCacheEntriesFromSendSuccess(cfg, row, partnerEmailResolved);
+  } catch (e) {
+    console.error("[executor] inbound cache update after success failed", { taskId: row.taskId, error: e?.message ?? e });
   }
   return { kind: "written", ok: true };
 }
@@ -1596,6 +1699,172 @@ async function runOnce({ cfg, enqueueAndWait }) {
   };
 }
 
+/**
+ * One Notion row to copy property types from when creating webhook-driven In rows.
+ */
+async function queryFirstTemplateQueueRow(notionCfg, databaseId, outreachStatusCol) {
+  const statusCol = String(outreachStatusCol || "OutReach Status").trim() || "OutReach Status";
+  const outFilter = {
+    and: [
+      { property: "Platform", select: { equals: "Email" } },
+      { property: "InNOut", select: { equals: "Out" } },
+      {
+        or: [
+          { property: "Action", select: { equals: "Send Email" } },
+          { property: "Action", select: { equals: "Reply Email" } },
+        ],
+      },
+      { property: statusCol, status: { equals: "Success" } },
+    ],
+  };
+  let data = await queryDatabase(notionCfg, databaseId, {
+    pageSize: 1,
+    filter: outFilter,
+    sorts: [{ property: "Completion Time", direction: "descending" }],
+  });
+  let page = data?.results?.[0];
+  if (!page) {
+    const inFilter = {
+      and: [
+        { property: "Platform", select: { equals: "Email" } },
+        { property: "InNOut", select: { equals: "In" } },
+      ],
+    };
+    data = await queryDatabase(notionCfg, databaseId, { pageSize: 1, filter: inFilter });
+    page = data?.results?.[0];
+  }
+  return page ? parseQueueRow(page) : null;
+}
+
+/**
+ * TB Active Receiver: POST JSON webhook → optional contact-cache filter → Notion In row.
+ * Headers: optional `X-TB-Receiver-Secret` when `executor.tb_receiver_webhook_secret` is set.
+ *
+ * @param {object} cfg loadConfig()
+ * @param {object} payload parsed JSON body
+ * @param {Record<string,string>} reqHeaders lower-case keys
+ * @returns {Promise<{ status: number, body: object }>}
+ */
+async function handleTbActiveReceiverWebhook(cfg, payload, reqHeaders = {}) {
+  const secret = String(cfg?.executor?.tbReceiverWebhookSecret || "").trim();
+  if (secret) {
+    const got = String(
+      reqHeaders["x-tb-receiver-secret"] || reqHeaders["x-tb-webhook-secret"] || ""
+    ).trim();
+    if (got !== secret) {
+      return { status: 401, body: { ok: false, error: "unauthorized" } };
+    }
+  }
+
+  if (!payload || typeof payload !== "object") {
+    return { status: 400, body: { ok: false, error: "invalid_payload" } };
+  }
+  if (Number(payload.schemaVersion) !== 1 || payload.type !== "tb-active-receiver.newMail") {
+    return { status: 400, body: { ok: false, error: "schema_mismatch", expected: { schemaVersion: 1, type: "tb-active-receiver.newMail" } } };
+  }
+
+  const fc = normalizeEmail(payload.fcAccount);
+  const author = extractEmail(payload.author);
+  if (!fc || !author) {
+    return { status: 400, body: { ok: false, error: "missing_fc_account_or_author" } };
+  }
+
+  const cacheMap = readContactCacheMapFresh(cfg);
+  const cacheKey = buildInboundCacheKey(fc, author);
+  const cacheEntry = cacheMap.get(cacheKey);
+  if (!cacheEntry?.keyPersonId) {
+    return { status: 200, body: { ok: true, skipped: true, reason: "not_in_contact_cache" } };
+  }
+
+  const dedupKey = buildInboundDedupKey(fc, {
+    headerMessageId: payload.headerMessageId,
+    messageId: payload.messageId,
+  });
+  if (!dedupKey) {
+    return { status: 400, body: { ok: false, error: "missing_header_message_id_and_message_id" } };
+  }
+  if (hasDedupeKey(cfg, dedupKey)) {
+    return { status: 200, body: { ok: true, skipped: true, reason: "dedupe" } };
+  }
+
+  const notionCfg = { token: cfg.notion.token, notionVersion: cfg.notion.notionVersion };
+  const databaseId = cfg.notion.databaseId;
+  const outreachStatusCol = cfg.executor?.notionPropertyNames?.Status || "OutReach Status";
+  let templateRow;
+  try {
+    templateRow = await queryFirstTemplateQueueRow(notionCfg, databaseId, outreachStatusCol);
+  } catch (e) {
+    console.error("[executor][webhook] template query failed", e?.message ?? e);
+    return { status: 503, body: { ok: false, error: "template_query_failed", detail: e?.message ?? String(e) } };
+  }
+  if (!templateRow?.raw) {
+    return { status: 503, body: { ok: false, error: "no_template_row" } };
+  }
+
+  const bodyPlain = typeof payload.bodyPlain === "string" ? payload.bodyPlain : "";
+  const bodyHtml = typeof payload.bodyHtml === "string" ? payload.bodyHtml : "";
+  const replyText = bodyPlain.trim() ? bodyPlain : stripHtmlToPlain(bodyHtml);
+
+  const sourceRow = { ...templateRow, fcAccount: fc };
+
+  const metadataPayload = {
+    headerMessageId: String(payload.headerMessageId || "").trim(),
+    conversationAnchor: String(payload.headerMessageId || "").trim(),
+    sourceOutPageId: "",
+    messageId: payload.messageId,
+    to_email: fc,
+    from_email: author,
+    subject: String(payload.subject || ""),
+    source: "tb-active-receiver.webhook",
+    schemaVersion: 1,
+    bodyPlain,
+    bodyHtml,
+    hasAttachments: !!payload.hasAttachments,
+    isReplyHint: payload.isReplyHint,
+    replyHintReason: payload.replyHintReason ?? null,
+    inReplyTo: payload.inReplyTo ?? null,
+    accountId: payload.accountId ?? null,
+    folderId: payload.folderId ?? null,
+    keyPersonId: cacheEntry.keyPersonId,
+  };
+
+  const inboundMsg = {
+    date: payload.receivedAt ? new Date(payload.receivedAt) : new Date(),
+    snippet: String(payload.subject || replyText || "Inbound (webhook)").slice(0, 500),
+    subject: String(payload.subject || ""),
+    replyText,
+    body: replyText,
+    headerMessageId: payload.headerMessageId,
+    messageId: payload.messageId,
+    payload: metadataPayload,
+  };
+
+  const createProps = buildInboundCreateProperties(
+    sourceRow,
+    inboundMsg,
+    cfg.executor?.notionPropertyNames,
+    cacheEntry.keyPersonId
+  );
+  if (Object.keys(createProps).length === 0) {
+    return { status: 503, body: { ok: false, error: "empty_create_props" } };
+  }
+
+  try {
+    const created = await createPage(notionCfg, databaseId, createProps);
+    addDedupeKey(cfg, dedupKey);
+    console.error("[executor][webhook] notion page created", {
+      pageId: created?.id,
+      dedupKey,
+      fcAccount: fc,
+      author,
+    });
+    return { status: 201, body: { ok: true, pageId: created?.id ?? null } };
+  } catch (e) {
+    console.error("[executor][webhook] createPage failed", e?.message ?? e);
+    return { status: 502, body: { ok: false, error: "notion_create_failed", detail: e?.message ?? String(e) } };
+  }
+}
+
 async function startExecutor({ cfg, enqueueAndWait }) {
   console.error("[executor] warmup executor started");
   console.error("  mode =", cfg.executor.mode);
@@ -1636,5 +1905,5 @@ async function startExecutor({ cfg, enqueueAndWait }) {
   }
 }
 
-module.exports = { startExecutor };
+module.exports = { startExecutor, handleTbActiveReceiverWebhook };
 

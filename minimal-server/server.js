@@ -12,7 +12,13 @@
 
 const http = require("http");
 const { loadConfig, printConfigSummary } = require("./config.js");
-const { startExecutor } = require("./executor.js");
+const { startExecutor, handleTbActiveReceiverWebhook } = require("./executor.js");
+const fileLogger = require("./fileLogger.js");
+
+fileLogger.initFileLogging({});
+
+/** Set when config loads; used by TB Active Receiver webhook. */
+let runtimeCfg = null;
 
 const PORT = parseInt(process.env.PORT || "3939", 10);
 /** Command wait timeout (ms). Reply/send may open UI or wait for network; default 120s. */
@@ -94,6 +100,24 @@ function enqueueAndWait(envelope, clientRes = null) {
   });
 }
 
+try {
+  runtimeCfg = loadConfig();
+  fileLogger.initFileLogging(runtimeCfg.logging);
+  if (runtimeCfg.logging.mirrorConsole !== false) {
+    fileLogger.installConsoleMirror();
+  }
+  printConfigSummary(runtimeCfg);
+  if (runtimeCfg.executor.enabled) {
+    startExecutor({ cfg: runtimeCfg, enqueueAndWait });
+  } else {
+    console.error("[executor] disabled by config/env (executor.enabled=false or EXECUTOR_ENABLED=0)");
+  }
+} catch (e) {
+  fileLogger.installConsoleMirror();
+  console.error("[executor] not started:", e?.message ?? e);
+  console.error("  Hint: copy minimal-server/config.example.json to minimal-server/config.json and fill it.");
+}
+
 const server = http.createServer((req, res) => {
   const url = req.url || "";
   const path = url.split("?")[0];
@@ -157,6 +181,88 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  const webhookPath = String(runtimeCfg?.executor?.tbReceiverReportPath || "/tb-active-receiver/report").split("?")[0];
+  if (req.method === "POST" && path === webhookPath) {
+    const client = req.socket?.remoteAddress || "";
+    if (!runtimeCfg) {
+      fileLogger.logTbReceiverWebhook({
+        outcome: "no_config",
+        client,
+        path,
+        httpStatus: 503,
+      });
+      send(res, 503, { ok: false, error: "server_config_unavailable" });
+      return;
+    }
+    const maxBytes = Number(runtimeCfg?.executor?.tbReportMaxBodyBytes) || 100 * 1024 * 1024;
+    let total = 0;
+    const chunks = [];
+    req.on("data", (chunk) => {
+      total += chunk.length;
+      if (total <= maxBytes) chunks.push(chunk);
+    });
+    req.on("end", async () => {
+      if (total > maxBytes) {
+        fileLogger.logTbReceiverWebhook({
+          outcome: "payload_too_large",
+          client,
+          path,
+          bytes: total,
+          maxBytes,
+          httpStatus: 413,
+        });
+        send(res, 413, { ok: false, error: "payload_too_large", maxBytes });
+        return;
+      }
+      let payload;
+      try {
+        const raw = Buffer.concat(chunks).toString("utf8");
+        payload = JSON.parse(raw);
+      } catch (e) {
+        fileLogger.logTbReceiverWebhook({
+          outcome: "invalid_json",
+          client,
+          path,
+          bytes: total,
+          httpStatus: 400,
+          error: e?.message ?? String(e),
+        });
+        send(res, 400, { ok: false, error: "invalid_json_or_handler", detail: e?.message ?? String(e) });
+        return;
+      }
+      try {
+        const headers = {};
+        for (const [k, v] of Object.entries(req.headers || {})) {
+          if (typeof v === "string") headers[k.toLowerCase()] = v;
+        }
+        const out = await handleTbActiveReceiverWebhook(runtimeCfg, payload, headers);
+        fileLogger.logTbReceiverWebhook({
+          outcome: out.status >= 400 ? "handler_rejected" : "handled",
+          client,
+          path,
+          bytes: total,
+          httpStatus: out.status,
+          payload: fileLogger.summarizeWebhookPayload(payload),
+          response: fileLogger.summarizeWebhookResponse(out.body),
+        });
+        send(res, out.status, out.body);
+      } catch (e) {
+        console.error("[minimal-server] webhook error", e?.message ?? e);
+        fileLogger.logTbReceiverWebhook({
+          outcome: "handler_exception",
+          client,
+          path,
+          bytes: total,
+          httpStatus: 400,
+          payload: fileLogger.summarizeWebhookPayload(payload),
+          error: e?.message ?? String(e),
+        });
+        send(res, 400, { ok: false, error: "invalid_json_or_handler", detail: e?.message ?? String(e) });
+      }
+    });
+    return;
+  }
+
   if (req.method === "POST" && path === "/command") {
     let body = "";
     req.on("data", (c) => (body += c));
@@ -186,6 +292,8 @@ server.listen(PORT, "127.0.0.1", () => {
   console.error("  POST /command - enqueue command (block until extension POST /done)");
   console.error("  GET  /next    - extension polls for next command");
   console.error("  POST /done    - extension posts result");
+  const wh = String(runtimeCfg?.executor?.tbReceiverReportPath || "/tb-active-receiver/report");
+  console.error("  POST", wh, "- TB Active Receiver inbound webhook (JSON)");
 });
 
 server.on("error", (err) => {
@@ -199,18 +307,3 @@ server.on("error", (err) => {
 
 // Export for internal callers (Warmup Executor). CommonJS export is safe in node.
 module.exports = { enqueueAndWait };
-
-// Start Warmup Executor in the same process (source of truth: local config file).
-// If config is missing/invalid, we still keep the HTTP server alive for manual /command use.
-try {
-  const cfg = loadConfig();
-  printConfigSummary(cfg);
-  if (cfg.executor.enabled) {
-    startExecutor({ cfg, enqueueAndWait });
-  } else {
-    console.error("[executor] disabled by config/env (executor.enabled=false or EXECUTOR_ENABLED=0)");
-  }
-} catch (e) {
-  console.error("[executor] not started:", e?.message ?? e);
-  console.error("  Hint: copy minimal-server/config.example.json to minimal-server/config.json and fill it.");
-}
