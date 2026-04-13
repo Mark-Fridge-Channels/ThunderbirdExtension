@@ -1218,14 +1218,26 @@ async function executeOne({ cfg, enqueueAndWait }, row) {
 
   const out = await enqueueAndWait(mapped.envelope);
   if (!out?.success) {
-    const detailText = makeDetail({
+    const errCode = out?.error?.code || "";
+    const errMsg = String(out?.error?.message || "");
+    const isSendAction = actionName === "Send Email" || actionName === "Reply Email";
+    const mayHaveSent = isSendAction && (
+      errCode === "TIMEOUT" ||
+      errMsg.toLowerCase().includes("fetch failed") ||
+      errMsg.toLowerCase().includes("timeout")
+    );
+    const warningPrefix = mayHaveSent
+      ? "⚠️ WARNING: Email may have been sent successfully despite this error. " +
+        "The extension timed out or lost connection during send — please verify in Sent folder before retrying.\n\n"
+      : "";
+    const detailText = warningPrefix + makeDetail({
       ok: false,
-      reason: "api_error",
+      reason: mayHaveSent ? "send_uncertain_timeout" : "api_error",
       action: mapped.envelope.action,
       requestId: mapped.envelope.request_id,
       extensionError: out?.error ?? out,
     });
-    return await failWriteback({ cfg, row, reason: "api_error", detail: detailText, externalEventId });
+    return await failWriteback({ cfg, row, reason: mayHaveSent ? "send_uncertain_timeout" : "api_error", detail: detailText, externalEventId });
   }
 
   const successDetail = makeDetail({
@@ -1369,7 +1381,79 @@ async function expireWriteback({ cfg, row, detail, externalEventId }) {
   }
 }
 
+/** Max age (ms) for a Progress claim before it is considered stale and recovered. */
+const STALE_CLAIM_MS = 10 * 60 * 1000; // 10 minutes
+
+/**
+ * Recover rows stuck in Progress (claimed_by_executor) due to process crash.
+ * Rolls them back to Todo so the next cycle can re-execute them.
+ */
+async function recoverStaleClaims({ cfg }) {
+  const notionCfg = { token: cfg.notion.token, notionVersion: cfg.notion.notionVersion };
+  const databaseId = cfg.notion.databaseId;
+  const outreachStatusCol = cfg.executor?.notionPropertyNames?.Status || "OutReach Status";
+  const propNames = cfg.executor?.notionPropertyNames;
+
+  try {
+    const filter = {
+      and: [
+        { property: "Platform", select: { equals: "Email" } },
+        { property: "InNOut", select: { equals: "Out" } },
+        { property: outreachStatusCol, status: { equals: "Progress" } },
+      ],
+    };
+    const data = await queryDatabase(notionCfg, databaseId, {
+      pageSize: 20,
+      filter,
+      sorts: [{ property: "Completion Time", direction: "ascending" }],
+    });
+    const pages = Array.isArray(data?.results) ? data.results : [];
+    const now = Date.now();
+    let recovered = 0;
+
+    for (const page of pages) {
+      const row = parseQueueRow(page);
+      if (!row.completionTime) continue;
+      const claimedAt = row.completionTime instanceof Date ? row.completionTime.valueOf() : Date.parse(row.completionTime);
+      if (!Number.isFinite(claimedAt)) continue;
+      const age = now - claimedAt;
+      if (age < STALE_CLAIM_MS) continue;
+
+      // This row has been stuck in Progress for too long — roll back to Todo.
+      try {
+        const rollbackProps = buildWritebackProperties({
+          statusName: "Todo",
+          executedAt: new Date(),
+          detailText: `⚠️ Auto-recovered from stale Progress (stuck for ${Math.round(age / 1000)}s). Previous claim was at ${row.completionTime instanceof Date ? row.completionTime.toISOString() : row.completionTime}. Will be re-executed next cycle.`,
+          externalEventId: row.externalEventId || "",
+        }, propNames);
+        await updatePage(notionCfg, row.pageId, rollbackProps);
+        recovered += 1;
+        console.error("[executor][stale-recovery] recovered stale claim", {
+          taskId: row.taskId,
+          pageId: row.pageId,
+          ageSeconds: Math.round(age / 1000),
+        });
+      } catch (e) {
+        console.error("[executor][stale-recovery] rollback failed", {
+          taskId: row.taskId,
+          error: e?.message ?? e,
+        });
+      }
+    }
+    if (recovered > 0) {
+      console.error("[executor][stale-recovery] recovered total", { recovered, scanned: pages.length });
+    }
+  } catch (e) {
+    // Non-fatal: if the stale-recovery query fails, just proceed with normal execution.
+    console.error("[executor][stale-recovery] query failed", { error: e?.message ?? e });
+  }
+}
+
 async function runOnce({ cfg, enqueueAndWait }) {
+  // Recover any rows stuck in Progress from a previous crash/restart.
+  await recoverStaleClaims({ cfg });
+
   const notionCfg = { token: cfg.notion.token, notionVersion: cfg.notion.notionVersion };
   const databaseId = cfg.notion.databaseId;
   const now = new Date();
@@ -1673,7 +1757,18 @@ async function runOnce({ cfg, enqueueAndWait }) {
       // We keep the loop resilient: unexpected errors should not crash the whole executor.
       // Best effort: write back executor_exception if we still can.
       try {
-        const detail = makeDetail({
+        const errMsg = String(e?.message ?? "");
+        const isSendAction = row.actionText === "Send Email" || row.actionText === "Reply Email";
+        const mayHaveSent = isSendAction && (
+          errMsg.toLowerCase().includes("fetch failed") ||
+          errMsg.toLowerCase().includes("timeout") ||
+          errMsg.toLowerCase().includes("network")
+        );
+        const warningPrefix = mayHaveSent
+          ? "⚠️ WARNING: Email may have been sent successfully despite this error. " +
+            "The extension crashed or lost connection during send — please verify in Sent folder before retrying.\n\n"
+          : "";
+        const detail = warningPrefix + makeDetail({
           ok: false,
           reason: "executor_exception",
           action: row.actionText,
@@ -1683,7 +1778,7 @@ async function runOnce({ cfg, enqueueAndWait }) {
         await failWriteback({
           cfg,
           row,
-          reason: "executor_exception",
+          reason: mayHaveSent ? "executor_exception_uncertain" : "executor_exception",
           detail,
           externalEventId: row.taskId && row.actionText ? computeExternalEventId(row.taskId, row.actionText) : "",
         });

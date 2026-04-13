@@ -27,8 +27,8 @@ const DEFAULT_OPTIONS = {
   useMailTabFallback: false,
   settleAfterFetchMs: 3000,
   pollingDisabledAccountIds: [],
-  /** Inbox reconcile alarm period (minutes); default 24h. Scans last 3 local calendar days. */
-  reconcileInboxMinutes: 1440,
+  /** Inbox reconcile alarm period (minutes); default 2h. Scans last 3 local calendar days. */
+  reconcileInboxMinutes: 120,
 };
 
 export async function loadOptions() {

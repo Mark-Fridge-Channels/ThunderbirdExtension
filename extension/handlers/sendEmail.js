@@ -77,18 +77,27 @@ export async function handleSendEmail({ payload }) {
     const afterSendPromise = waitForAfterSend(composeTabId, AFTER_SEND_TIMEOUT_MS);
     const result = await browser.compose.sendMessage(composeTabId, { mode: sendMode });
     const afterSend = await afterSendPromise;
-    if (afterSend?.error) {
-      return {
-        success: false,
-        error: makeError(CODES.API_ERROR, afterSend.error, {
-          phase: "onAfterSend",
-          mode: afterSend?.mode ?? sendMode,
-          sendInfo: afterSend,
-          sendMessageResult: normalizeSendResult(result),
-        }),
-      };
-    }
     const normalized = normalizeSendResult(afterSend?.mode ? afterSend : result);
+    if (afterSend?.error) {
+      // If headerMessageId was obtained (from sendMessage result or afterSend),
+      // treat as a warning instead of a hard failure — TB sometimes fills error
+      // for cosmetic reasons (e.g. "Missing headerMessageId") even after success.
+      if (normalized.headerMessageId) {
+        normalized.warnings = (normalized.warnings || []).concat([
+          `afterSend_error_downgraded: ${afterSend.error}`,
+        ]);
+      } else {
+        return {
+          success: false,
+          error: makeError(CODES.API_ERROR, afterSend.error, {
+            phase: "onAfterSend",
+            mode: afterSend?.mode ?? sendMode,
+            sendInfo: afterSend,
+            sendMessageResult: normalizeSendResult(result),
+          }),
+        };
+      }
+    }
     if (normalized.mode !== "sendLater" && !normalized.headerMessageId) {
       // Thunderbird may complete SMTP send successfully but still omit headerMessageId.
       // Treat as success to avoid false-negative writeback; keep warning for observability.

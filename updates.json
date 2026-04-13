@@ -3,6 +3,10 @@
     "mail_automation_agent@markbai.thunderbird.local": {
       "updates": [
         {
+          "version": "1.0.11",
+          "update_link": "https://github.com/Mark-Fridge-Channels/ThunderbirdExtension/releases/download/v1.0.11/extension-1.0.11.xpi"
+        },
+        {
           "version": "1.0.10",
           "update_link": "https://github.com/Mark-Fridge-Channels/ThunderbirdExtension/releases/download/v1.0.10/extension-1.0.10.xpi"
         },
@@ -50,6 +54,10 @@
     },
     "tb_active_receiver_standalone@markbai.thunderbird.local": {
       "updates": [
+        {
+          "version": "1.0.18",
+          "update_link": "https://github.com/Mark-Fridge-Channels/ThunderbirdExtension/releases/download/v1.0.18/tb-active-receiver-1.0.18.xpi"
+        },
         {
           "version": "1.0.17",
           "update_link": "https://github.com/Mark-Fridge-Channels/ThunderbirdExtension/releases/download/v1.0.17/tb-active-receiver-1.0.17.xpi"

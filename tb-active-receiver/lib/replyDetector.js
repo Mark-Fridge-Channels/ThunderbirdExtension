@@ -15,8 +15,10 @@ async function loadInboxKeys() {
 }
 
 function isPollingInboxFolder(folder, header, inboxKeys) {
-  const aid = header.folder?.accountId ?? folder?.accountId;
-  const fid = header.folder?.id ?? folder?.id;
+  // folder is the MailFolder passed to onNewMailReceived; it reliably has accountId in TB 128+.
+  // header.folder may lack accountId in some TB versions, causing all messages to be filtered out.
+  const aid = folder?.accountId ?? header.folder?.accountId;
+  const fid = folder?.id ?? header.folder?.id;
   if (!aid || fid == null) return false;
   return inboxKeys.has(`${aid}:${fid}`);
 }
