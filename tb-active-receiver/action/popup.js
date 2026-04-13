@@ -30,3 +30,16 @@ document.getElementById("fetchCurrent").addEventListener("click", async () => {
   await browser.runtime.sendMessage({ type: "tbActiveRx.fetchNowCurrent" });
   await refresh();
 });
+
+document.getElementById("reconcileInbox").addEventListener("click", async () => {
+  const btn = document.getElementById("reconcileInbox");
+  btn.disabled = true;
+  btn.textContent = "Reconciling…";
+  try {
+    await browser.runtime.sendMessage({ type: "tbActiveRx.reconcileInboxNow" });
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Reconcile Inbox Now";
+  }
+  await refresh();
+});
