@@ -43,3 +43,16 @@ document.getElementById("reconcileInbox").addEventListener("click", async () => 
   }
   await refresh();
 });
+
+document.getElementById("debugLogInbox").addEventListener("click", async () => {
+  const btn = document.getElementById("debugLogInbox");
+  btn.disabled = true;
+  btn.textContent = "Logging…";
+  try {
+    await browser.runtime.sendMessage({ type: "tbActiveRx.debugLogInbox" });
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Log Inbox messages";
+  }
+  await refresh();
+});

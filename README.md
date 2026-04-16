@@ -11,7 +11,25 @@
   ```bash
   ./scripts/build-xpi.sh
   ```
-  生成 **`extension.xpi`**，再在 Thunderbird 中选择「从文件安装附加组件」选中该 `.xpi` 文件。
+  生成 **`extension.xpi`**（以及带版本号的 **`extension-<x.y.z>.xpi`**），再在 Thunderbird 中选择「从文件安装附加组件」选中该 `.xpi` 文件。
+
+### 版本号与 `updates.json`
+
+每次执行打包脚本都会：将对应 `manifest.json` 的 **patch 版本 +1**（`x.y.z`）、写入 `browser_specific_settings.gecko.update_url`，并在仓库根目录 **`updates.json`** 里追加该扩展的 `update_link`（指向 GitHub Releases 上的同名 `.xpi` 资源 URL）。
+
+### 推送到 GitHub Releases
+
+默认 **`PUBLISH_MODE=2`**：在生成 `.xpi` 后会 **提交** `manifest.json` 与 `updates.json`、**推送**当前分支，并用 **`gh`** 创建或更新对应 **GitHub Release** 资产。需已安装并登录 [GitHub CLI](https://cli.github.com/)，且当前分支不是 detached HEAD。
+
+若只想本机打包、**不** commit / push / Release：
+
+```bash
+PUBLISH_MODE=0 ./scripts/build-xpi.sh
+# 独立收信扩展：
+PUBLISH_MODE=0 ./scripts/build-tb-active-receiver-xpi.sh
+```
+
+`updates.json` 里的 `update_url` 指向的 raw 分支默认为 **`notion-brain-real-email`**；若需与当前发布分支一致，可设置环境变量 **`RELEASE_BRANCH`**（与 `scripts/build-xpi.sh` 内逻辑一致）。
 
 ## 运行前置条件
 

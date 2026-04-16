@@ -235,6 +235,8 @@ const server = http.createServer((req, res) => {
         send(res, 400, { ok: false, error: "invalid_json_or_handler", detail: e?.message ?? String(e) });
         return;
       }
+      // Log raw payload BEFORE any filtering or handler logic
+      fileLogger.logRawReportPayload({ client, path, bytes: total, payload });
       try {
         const headers = {};
         for (const [k, v] of Object.entries(req.headers || {})) {

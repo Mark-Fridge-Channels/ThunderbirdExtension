@@ -86,6 +86,15 @@ async function createPage(cfg, databaseId, properties) {
     properties,
   });
 }
+async function appendBlockChildren(cfg, blockId, children) {
+  const id = String(blockId || "").replace(/-/g, "");
+  if (!id) throw new Error("appendBlockChildren: blockId required");
+  const hyphenated =
+    id.length === 32
+      ? `${id.slice(0, 8)}-${id.slice(8, 12)}-${id.slice(12, 16)}-${id.slice(16, 20)}-${id.slice(20)}`
+      : String(blockId);
+  return await notionFetch(cfg, "PATCH", `/blocks/${hyphenated}/children`, { children });
+}
 
-module.exports = { queryDatabase, getPage, updatePage, createPage };
+module.exports = { queryDatabase, getPage, updatePage, createPage, appendBlockChildren };
 

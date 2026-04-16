@@ -11,7 +11,7 @@
  * - "Already executed" is decided by the presence of `external_event_id` on the row.
  */
 
-const { queryDatabase, updatePage, createPage, getPage } = require("./notion.js");
+const { queryDatabase, updatePage, createPage, getPage, appendBlockChildren } = require("./notion.js");
 const { parseQueueRow, isWithinWindow, computeExternalEventId, readSelectName, readEmailValue } = require("./queueParser.js");
 const { mergeDedupeKeysInto, hasDedupeKey, addDedupeKey } = require("./inboundDedupe.js");
 const fs = require("fs");
@@ -349,6 +349,11 @@ function buildInboundCacheKey(fcAccount, counterpartyEmail) {
   return `${normalizeEmail(fcAccount)}|${normalizeEmail(counterpartyEmail)}`;
 }
 
+/** Strip RFC 2822 angle-bracket wrapping from a Message-ID so stored keys and lookup keys always match. */
+function normalizeMessageId(id) {
+  return String(id || "").trim().replace(/^<+|>+$/g, "").trim();
+}
+
 function getInboundCachePath(cfg) {
   const p = String(cfg?.executor?.inboundContactCachePath || "").trim();
   if (!p) return path.join(__dirname, "inbound-contact-cache.json");
@@ -383,11 +388,29 @@ function loadInboundContactCache(cfg) {
     if (!fc || !cp || !kp) continue;
     const k = buildInboundCacheKey(fc, cp);
     // first-write wins
-    if (!byKey.has(k)) byKey.set(k, { fcAccount: fc, counterpartyEmail: cp, keyPersonId: kp });
+    if (!byKey.has(k)) byKey.set(k, {
+      fcAccount: fc,
+      counterpartyEmail: cp,
+      keyPersonId: kp,
+      entityPageId: String(e?.entityPageId || "").trim(),
+    });
   }
+
+  const messageMap = new Map();
+  if (parsed?.messageMap) {
+    for (const [k, v] of Object.entries(parsed.messageMap)) messageMap.set(k, v);
+  }
+
+  const domainMap = new Map();
+  if (parsed?.domainMap) {
+    for (const [k, v] of Object.entries(parsed.domainMap)) domainMap.set(k, v);
+  }
+
   inboundContactCacheState = {
     path: cachePath,
     byKey,
+    messageMap,
+    domainMap,
     lastScanAtByAccount: parsed?.lastScanAtByAccount && typeof parsed.lastScanAtByAccount === "object"
       ? { ...parsed.lastScanAtByAccount }
       : {},
@@ -399,9 +422,11 @@ function saveInboundContactCache(state) {
   if (!state?.path) return;
   const entries = Array.from(state.byKey.values());
   const payload = {
-    version: 1,
-    updatedAt: nowIso(),
+    version: 2,
+    updatedAt: new Date().toISOString(),
     entries,
+    messageMap: Object.fromEntries(state.messageMap.entries()),
+    domainMap: Object.fromEntries(state.domainMap.entries()),
     lastScanAtByAccount: state.lastScanAtByAccount || {},
   };
   const dir = path.dirname(state.path);
@@ -426,18 +451,22 @@ function collectOutboundRecipientEmailsForCache(row, partnerEmailResolved) {
 }
 
 /**
- * Merge one (fcAccount, counterpartyEmail, keyPersonId) into the JSON cache if missing.
+ * Merge one (fcAccount, counterpartyEmail, keyPersonId, entityPageId) into the JSON cache if missing.
  * Fresh read/write so webhook (`readContactCacheMapFresh`) sees updates; clears in-memory cache.
  */
-function appendInboundCacheEntriesFromSendSuccess(cfg, row, partnerEmailResolved) {
+function appendInboundCacheEntriesFromSendSuccess(cfg, row, partnerEmailResolved, payloadText) {
   const fc = normalizeEmail(row?.fcAccount);
   const kp = String(row?.keyPersonPageId || "").trim();
+  const ep = String(row?.entityPageId || "").trim();
   if (!fc || !kp) return;
   if (row?.inNOut !== "Out") return;
   if (row?.actionText !== "Send Email" && row?.actionText !== "Reply Email") return;
 
   const recipients = collectOutboundRecipientEmailsForCache(row, partnerEmailResolved);
   if (recipients.length === 0) return;
+
+  let minPayload = null;
+  if (payloadText) minPayload = safeJsonParse(payloadText, null);
 
   const cachePath = getInboundCachePath(cfg);
   let parsed = null;
@@ -447,45 +476,72 @@ function appendInboundCacheEntriesFromSendSuccess(cfg, row, partnerEmailResolved
   } catch (_) {
     parsed = null;
   }
-  const byKey = new Map();
+
+  const state = {
+    path: cachePath,
+    byKey: new Map(),
+    messageMap: new Map(Object.entries(parsed?.messageMap || {})),
+    domainMap: new Map(Object.entries(parsed?.domainMap || {})),
+    lastScanAtByAccount: parsed?.lastScanAtByAccount || {}
+  };
+
   for (const e of Array.isArray(parsed?.entries) ? parsed.entries : []) {
     const f = normalizeEmail(e?.fcAccount);
     const c = normalizeEmail(e?.counterpartyEmail);
     const kid = String(e?.keyPersonId || "").trim();
     if (!f || !c || !kid) continue;
     const k = buildInboundCacheKey(f, c);
-    if (!byKey.has(k)) byKey.set(k, { fcAccount: f, counterpartyEmail: c, keyPersonId: kid });
+    if (!state.byKey.has(k)) state.byKey.set(k, {
+      fcAccount: f,
+      counterpartyEmail: c,
+      keyPersonId: kid,
+      entityPageId: String(e?.entityPageId || "").trim(),
+    });
   }
 
   let added = 0;
   for (const cp of recipients) {
     const key = buildInboundCacheKey(fc, cp);
-    if (byKey.has(key)) continue;
-    byKey.set(key, { fcAccount: fc, counterpartyEmail: cp, keyPersonId: kp });
-    added += 1;
-  }
-  if (added === 0) return;
+    if (!state.byKey.has(key)) {
+      state.byKey.set(key, { fcAccount: fc, counterpartyEmail: cp, keyPersonId: kp, entityPageId: ep });
+      added += 1;
+    }
 
-  const payload = {
-    version: 1,
-    updatedAt: nowIso(),
-    entries: Array.from(byKey.values()),
-    lastScanAtByAccount:
-      parsed?.lastScanAtByAccount && typeof parsed.lastScanAtByAccount === "object"
-        ? { ...parsed.lastScanAtByAccount }
-        : {},
-  };
-  const dir = path.dirname(cachePath);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(cachePath, JSON.stringify(payload, null, 2), "utf8");
+    // Domain mapping — entityId = Entity page ID (Entity Name relation), not KeyPerson ID
+    const parts = cp.split('@');
+    if (parts.length === 2 && parts[1]) {
+      const domain = parts[1].toLowerCase();
+      if (!["gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "qq.com", "163.com", "icloud.com"].includes(domain)) {
+        state.domainMap.set(domain, { entityId: ep || kp, lastSentAt: new Date().toISOString() });
+      }
+    }
+  }
+
+  // Message ID mapping — entityId = Entity page ID; normalize to strip angle brackets
+  if (minPayload?.headerMessageId) {
+    const normalizedMsgId = normalizeMessageId(minPayload.headerMessageId);
+    if (normalizedMsgId) {
+      state.messageMap.set(normalizedMsgId, {
+        entityId: ep || kp,
+        outboundPageId: row?.pageId || "",
+      });
+    }
+  }
+
+  saveInboundContactCache(state);
   inboundContactCacheState = null;
-  console.error("[executor] inbound contact cache updated after send", { fcAccount: fc, added, totalKeys: byKey.size });
+  console.error("[executor] inbound contact cache updated after send", { fcAccount: fc, added, totalKeys: state.byKey.size });
 }
 
 /** Read contact cache JSON from disk (fresh read for webhook; does not use in-memory cache). */
 function readContactCacheMapFresh(cfg) {
   const cachePath = getInboundCachePath(cfg);
-  const byKey = new Map();
+  const state = {
+    byKey: new Map(),
+    messageMap: new Map(),
+    domainMap: new Map(),
+    lastScanAtByAccount: {},
+  };
   try {
     const raw = fs.readFileSync(cachePath, "utf8");
     const parsed = JSON.parse(raw);
@@ -495,12 +551,143 @@ function readContactCacheMapFresh(cfg) {
       const kp = String(e?.keyPersonId || "").trim();
       if (!fc || !cp || !kp) continue;
       const k = buildInboundCacheKey(fc, cp);
-      if (!byKey.has(k)) byKey.set(k, { keyPersonId: kp, fcAccount: fc, counterpartyEmail: cp });
+      if (!state.byKey.has(k)) state.byKey.set(k, {
+        keyPersonId: kp,
+        entityPageId: String(e?.entityPageId || "").trim(),
+        fcAccount: fc,
+        counterpartyEmail: cp,
+      });
+    }
+    if (parsed?.messageMap) {
+      for (const [k, v] of Object.entries(parsed.messageMap)) state.messageMap.set(k, v);
+    }
+    if (parsed?.domainMap) {
+      for (const [k, v] of Object.entries(parsed.domainMap)) state.domainMap.set(k, v);
+    }
+    if (parsed?.lastScanAtByAccount && typeof parsed.lastScanAtByAccount === "object") {
+      state.lastScanAtByAccount = { ...parsed.lastScanAtByAccount };
     }
   } catch (_) {
-    /* missing file or invalid JSON → empty map */
+    /* missing file or invalid JSON → empty maps */
   }
-  return byKey;
+  return state;
+}
+
+async function initResolverCache(cfg) {
+  if (!cfg.executor.initResolverCacheOnStartup) return;
+  const cacheMap = readContactCacheMapFresh(cfg);
+  
+  if (cacheMap.messageMap.size > 0 && cacheMap.domainMap.size > 0) {
+    console.error("[executor] initResolverCache: messageMap/domainMap are already somewhat populated. Appending missing recent ones...");
+  }
+  
+  console.error("[executor] initResolverCache: Starting backfill from Notion...");
+  const notionCfg = { token: cfg.notion.token, notionVersion: cfg.notion.notionVersion };
+  const databaseId = cfg.notion.databaseId;
+  const statusCol = String(cfg.executor?.notionPropertyNames?.Status || "OutReach Status").trim() || "OutReach Status";
+
+  const filter = {
+    and: [
+      { property: "Platform", select: { equals: "Email" } },
+      { property: "InNOut", select: { equals: "Out" } },
+      {
+        or: [
+          { property: "Action", select: { equals: "Send Email" } },
+          { property: "Action", select: { equals: "Reply Email" } },
+        ],
+      },
+      { property: statusCol, status: { equals: "Success" } },
+    ],
+  };
+  const sorts = [{ property: "Completion Time", direction: "descending" }];
+  
+  let addedDomains = 0;
+  let addedMessages = 0;
+  let cursor = undefined;
+  const outRows = [];
+  
+  try {
+    while (outRows.length < 500) {
+      const data = await queryDatabase(notionCfg, databaseId, {
+        pageSize: 100,
+        sorts,
+        filter,
+        startCursor: cursor,
+      });
+      const chunk = Array.isArray(data?.results) ? data.results : [];
+      outRows.push(...chunk);
+      if (!data?.has_more || !data?.next_cursor || chunk.length === 0) break;
+      cursor = data.next_cursor;
+    }
+  } catch (e) {
+    console.error("[executor] initResolverCache: queryDatabase failed", e?.message ?? e);
+    return;
+  }
+  
+  console.error(`[executor] initResolverCache: Pulled ${outRows.length} recent Outbound rows from Notion.`);
+
+  let addedEntries = 0;
+
+  for (const page of outRows) {
+    let row;
+    try {
+      row = parseQueueRow(page);
+    } catch (_) { continue; }
+
+    const fc = normalizeEmail(row?.fcAccount);
+    const cp = normalizeEmail(row?.counterpartyEmail);
+    const kp = String(row?.keyPersonPageId || "").trim();
+    const ep = String(row?.entityPageId || "").trim();
+    if (!fc || !kp) continue;
+
+    // Participant entries (byKey) — covers counterpartyEmail + all To/CC recipients
+    const recipients = collectOutboundRecipientEmailsForCache(row, cp);
+    for (const r of recipients) {
+      const key = buildInboundCacheKey(fc, r);
+      if (!cacheMap.byKey.has(key)) {
+        cacheMap.byKey.set(key, { fcAccount: fc, counterpartyEmail: r, keyPersonId: kp, entityPageId: ep });
+        addedEntries++;
+      }
+    }
+
+    // Domain mapping — entityId = Entity page ID (Entity Name relation)
+    if (cp) {
+      const parts = cp.split('@');
+      if (parts.length === 2 && parts[1]) {
+        const domain = parts[1].toLowerCase();
+        if (!["gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "qq.com", "163.com", "icloud.com"].includes(domain)) {
+          if (!cacheMap.domainMap.has(domain)) {
+            cacheMap.domainMap.set(domain, { entityId: ep || kp, lastSentAt: row.executedAt || new Date().toISOString() });
+            addedDomains++;
+          }
+        }
+      }
+    }
+
+    // Message ID mapping — entityId = Entity page ID; normalized to strip angle brackets
+    const p = row?.payload || {};
+    const rawHeaderMessageId = p.headerMessageId || p.messageId;
+    const headerMessageId = normalizeMessageId(rawHeaderMessageId);
+    if (headerMessageId && !cacheMap.messageMap.has(headerMessageId)) {
+      cacheMap.messageMap.set(headerMessageId, { entityId: ep || kp, outboundPageId: row.pageId });
+      addedMessages++;
+    }
+  }
+
+  if (addedDomains > 0 || addedMessages > 0 || addedEntries > 0) {
+    const state = {
+      path: getInboundCachePath(cfg),
+      byKey: cacheMap.byKey,
+      messageMap: cacheMap.messageMap,
+      domainMap: cacheMap.domainMap,
+      lastScanAtByAccount: cacheMap.lastScanAtByAccount || {},
+    };
+    saveInboundContactCache(state);
+    inboundContactCacheState = null;
+    console.error(`[executor] initResolverCache: Backfilled ${addedMessages} messages, ${addedDomains} domains, ${addedEntries} participants.`);
+  } else {
+    console.error("[executor] initResolverCache: No new mappings found in Notion to backfill.");
+  }
 }
 
 function stripHtmlToPlain(s) {
@@ -1327,7 +1514,7 @@ async function successWriteback({ cfg, row, detail, externalEventId, payloadText
     throw e;
   }
   try {
-    appendInboundCacheEntriesFromSendSuccess(cfg, row, partnerEmailResolved);
+    appendInboundCacheEntriesFromSendSuccess(cfg, row, partnerEmailResolved, payloadText);
   } catch (e) {
     console.error("[executor] inbound cache update after success failed", { taskId: row.taskId, error: e?.message ?? e });
   }
@@ -1865,12 +2052,6 @@ async function handleTbActiveReceiverWebhook(cfg, payload, reqHeaders = {}) {
   }
 
   const cacheMap = readContactCacheMapFresh(cfg);
-  const cacheKey = buildInboundCacheKey(fc, author);
-  const cacheEntry = cacheMap.get(cacheKey);
-  if (!cacheEntry?.keyPersonId) {
-    return { status: 200, body: { ok: true, skipped: true, reason: "not_in_contact_cache" } };
-  }
-
   const dedupKey = buildInboundDedupKey(fc, {
     headerMessageId: payload.headerMessageId,
     messageId: payload.messageId,
@@ -1882,81 +2063,127 @@ async function handleTbActiveReceiverWebhook(cfg, payload, reqHeaders = {}) {
     return { status: 200, body: { ok: true, skipped: true, reason: "dedupe" } };
   }
 
-  const notionCfg = { token: cfg.notion.token, notionVersion: cfg.notion.notionVersion };
-  const databaseId = cfg.notion.databaseId;
-  const outreachStatusCol = cfg.executor?.notionPropertyNames?.Status || "OutReach Status";
-  let templateRow;
-  try {
-    templateRow = await queryFirstTemplateQueueRow(notionCfg, databaseId, outreachStatusCol);
-  } catch (e) {
-    console.error("[executor][webhook] template query failed", e?.message ?? e);
-    return { status: 503, body: { ok: false, error: "template_query_failed", detail: e?.message ?? String(e) } };
+  let entityId = null;
+  let matchReason = "unmatched";
+  let classification = "Unknown";
+  let outboundPageId = "";
+
+  const inReplyTo = String(payload.inReplyTo || "").trim();
+  const references = String(payload.references || "").trim();
+  const threadId = String(payload.threadId || "").trim();
+  
+  // Normalize every candidate ID before lookup so angle-bracket variants in email headers always match
+  const headersToMatch = [];
+  if (inReplyTo) {
+    const n = normalizeMessageId(inReplyTo);
+    if (n) headersToMatch.push(n);
   }
-  if (!templateRow?.raw) {
-    return { status: 503, body: { ok: false, error: "no_template_row" } };
+  if (references) {
+    for (const r of references.split(/\s+/)) {
+      const n = normalizeMessageId(r);
+      if (n) headersToMatch.push(n);
+    }
   }
 
+  for (const ref of headersToMatch) {
+    if (cacheMap.messageMap.has(ref)) {
+      const msgInfo = cacheMap.messageMap.get(ref);
+      entityId = msgInfo.entityId;
+      outboundPageId = msgInfo.outboundPageId;
+      matchReason = "header_chain_match";
+      classification = "Human Reply In Thread";
+      break;
+    }
+  }
+
+  if (!entityId) {
+    const authorDomainMatch = author.match(/@(.+)$/);
+    if (authorDomainMatch) {
+      const domain = authorDomainMatch[1].toLowerCase();
+      if (cacheMap.domainMap.has(domain)) {
+        const domainInfo = cacheMap.domainMap.get(domain);
+        entityId = domainInfo.entityId;
+        matchReason = "same_domain_forward";
+        classification = "Human Reply Forwarded";
+      }
+    }
+  }
+
+  if (!entityId) {
+    const cacheKey = buildInboundCacheKey(fc, author);
+    const exactMatch = cacheMap.byKey.get(cacheKey);
+    if (exactMatch) {
+      // Prefer entityPageId (Entity Name relation); fall back to keyPersonId for older cache entries
+      entityId = exactMatch.entityPageId || exactMatch.keyPersonId;
+      matchReason = "participant_match";
+      classification = "Human Reply Out Of Thread";
+    }
+  }
+
+  if (!entityId) {
+    return { status: 200, body: { ok: true, skipped: true, reason: "not_in_contact_cache_or_domain" } };
+  }
+
+  const notionCfg = { token: cfg.notion.token, notionVersion: cfg.notion.notionVersion };
+  
   const bodyPlain = typeof payload.bodyPlain === "string" ? payload.bodyPlain : "";
   const bodyHtml = typeof payload.bodyHtml === "string" ? payload.bodyHtml : "";
   const replyText = bodyPlain.trim() ? bodyPlain : stripHtmlToPlain(bodyHtml);
+  const safeReplyText = replyText.slice(0, 1500) + (replyText.length > 1500 ? "..." : "");
 
-  const sourceRow = { ...templateRow, fcAccount: fc };
+  const timestamp = payload.receivedAt ? new Date(payload.receivedAt) : new Date();
 
-  const metadataPayload = {
-    headerMessageId: String(payload.headerMessageId || "").trim(),
-    conversationAnchor: String(payload.headerMessageId || "").trim(),
-    sourceOutPageId: "",
-    messageId: payload.messageId,
-    to_email: fc,
-    from_email: author,
-    subject: String(payload.subject || ""),
-    source: "tb-active-receiver.webhook",
-    schemaVersion: 1,
-    bodyPlain,
-    bodyHtml,
-    hasAttachments: !!payload.hasAttachments,
-    isReplyHint: payload.isReplyHint,
-    replyHintReason: payload.replyHintReason ?? null,
-    inReplyTo: payload.inReplyTo ?? null,
-    accountId: payload.accountId ?? null,
-    folderId: payload.folderId ?? null,
-    keyPersonId: cacheEntry.keyPersonId,
-  };
-
-  const inboundMsg = {
-    date: payload.receivedAt ? new Date(payload.receivedAt) : new Date(),
-    snippet: String(payload.subject || replyText || "Inbound (webhook)").slice(0, 500),
-    subject: String(payload.subject || ""),
-    replyText,
-    body: replyText,
-    headerMessageId: payload.headerMessageId,
-    messageId: payload.messageId,
-    payload: metadataPayload,
-  };
-
-  const createProps = buildInboundCreateProperties(
-    sourceRow,
-    inboundMsg,
-    cfg.executor?.notionPropertyNames,
-    cacheEntry.keyPersonId
-  );
-  if (Object.keys(createProps).length === 0) {
-    return { status: 503, body: { ok: false, error: "empty_create_props" } };
-  }
+  const blocks = [
+    {
+      object: "block",
+      type: "divider",
+      divider: {}
+    },
+    {
+      object: "block",
+      type: "heading_3",
+      heading_3: {
+        rich_text: [{ type: "text", text: { content: `[${classification}] ${timestamp.toISOString().slice(0,19).replace('T', ' ')}` } }]
+      }
+    },
+    {
+      object: "block",
+      type: "paragraph",
+      paragraph: {
+        rich_text: [
+          { type: "text", text: { content: "From: " }, annotations: { bold: true } },
+          { type: "text", text: { content: `${payload.author}\n` } },
+          { type: "text", text: { content: "To: " }, annotations: { bold: true } },
+          { type: "text", text: { content: `${fc}\n` } },
+          { type: "text", text: { content: "Subject: " }, annotations: { bold: true } },
+          { type: "text", text: { content: `${payload.subject}\n` } },
+          { type: "text", text: { content: "Match Reason: " }, annotations: { bold: true, color: "gray" } },
+          { type: "text", text: { content: `${matchReason}` }, annotations: { color: "gray" } }
+        ]
+      }
+    },
+    {
+      object: "block",
+      type: "quote",
+      quote: {
+        rich_text: [{ type: "text", text: { content: safeReplyText || "(No Content)" } }]
+      }
+    }
+  ];
 
   try {
-    const created = await createPage(notionCfg, databaseId, createProps);
+    await appendBlockChildren(notionCfg, entityId, blocks);
     addDedupeKey(cfg, dedupKey);
-    console.error("[executor][webhook] notion page created", {
-      pageId: created?.id,
+    console.error("[executor][webhook] appended reply to entity page", {
+      entityId,
       dedupKey,
-      fcAccount: fc,
-      author,
+      classification,
+      matchReason
     });
-    return { status: 201, body: { ok: true, pageId: created?.id ?? null } };
+    return { status: 201, body: { ok: true, entityId, matchReason } };
   } catch (e) {
-    console.error("[executor][webhook] createPage failed", e?.message ?? e);
-    return { status: 502, body: { ok: false, error: "notion_create_failed", detail: e?.message ?? String(e) } };
+    console.error("[executor][webhook] appendBlockChildren failed", e?.message ?? e);
+    return { status: 502, body: { ok: false, error: "notion_append_failed", detail: e?.message ?? String(e) } };
   }
 }
 
@@ -1968,10 +2195,17 @@ async function startExecutor({ cfg, enqueueAndWait }) {
   console.error("  poll_interval_ms =", cfg.executor.pollIntervalMs);
   console.error("  page_size =", cfg.executor.pageSize);
   console.error("  max_tasks_per_cycle =", cfg.executor.maxTasksPerCycle || "(unlimited)");
+  console.error("  init_resolver_cache_on_startup =", !!cfg.executor.initResolverCacheOnStartup);
   console.error("  inbound_poll_interval_ms =", cfg.executor.inboundPollIntervalMs);
   console.error("  max_inbound_checks_per_cycle =", cfg.executor.maxInboundChecksPerCycle);
   if (!cfg.executor.enableOutbound && !cfg.executor.enableInbound) {
     console.error("[executor] both outbound and inbound are disabled; executor loop will stay idle");
+  }
+
+  try {
+     await initResolverCache(cfg);
+  } catch (e) {
+     console.error("[executor] initResolverCache failed:", e?.message ?? e);
   }
 
   // Initial delay is 0: run immediately on boot.

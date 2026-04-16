@@ -98,7 +98,7 @@ echo "Built ./${XPI_VERSIONED} (and copied to ./${XPI_BASE}.xpi)"
 echo "  version bumped to: ${NEW_VERSION}"
 echo "  updates.json update_link: ${UPDATE_LINK}"
 
-PUBLISH_MODE="${PUBLISH_MODE:-0}" # 0=off, 2=release+commit+push
+PUBLISH_MODE="${PUBLISH_MODE:-2}" # 0=off, 2=release+commit+push (default: 2)
 if [[ "$PUBLISH_MODE" == "2" ]]; then
   if ! command -v gh >/dev/null 2>&1; then
     echo "PUBLISH_MODE=2 requires 'gh' CLI in PATH." >&2

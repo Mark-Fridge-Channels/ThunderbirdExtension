@@ -167,6 +167,8 @@ export async function buildTbWebhookPayload(messageId, accountId, folderId, incl
     isReplyHint: isReply,
     replyHintReason: reason,
     inReplyTo: inReplyTo || null,
+    references: references || null,
+    threadId: header.threadId ?? null,
     reportSource,
   };
 }

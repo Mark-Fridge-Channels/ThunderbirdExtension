@@ -265,6 +265,7 @@ function parseQueueRow(page) {
     body = firstNonEmpty(readRichText(bodyProp), payload?.body);
   }
   const keyPersonPageId = readRelationFirstId(firstDefined(props, ["KeyPerson ID", "key_person_id", "keyPersonId"]));
+  const entityPageId = readRelationFirstId(firstDefined(props, ["Entity Name", "entity_name", "entityName"]));
 
   const taskIdProp = firstDefined(props, ["Task ID", "task_id", "taskId"]);
   let taskIdFromCol = "";
@@ -295,6 +296,7 @@ function parseQueueRow(page) {
     actorEmail,
     counterpartyEmail,
     keyPersonPageId,
+    entityPageId,
     fromEmail: actorEmail,
     subject,
     body,

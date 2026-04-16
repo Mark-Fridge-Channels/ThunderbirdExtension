@@ -149,14 +149,50 @@ function logTbReceiverRequestReceived({ client, path, contentLength }) {
   }
 }
 
+/** Write a line to the dedicated tb-receiver-report daily log file. */
+function appendToReportLog(line) {
+  if (!opts.enabled) return;
+  try {
+    const dir = opts.directory;
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const day = new Date().toISOString().slice(0, 10);
+    const filePath = path.join(dir, `tb-receiver-report-${day}.log`);
+    const ts = new Date().toISOString();
+    fs.appendFileSync(filePath, `[${ts}] ${line}\n`, "utf8");
+  } catch (e) {
+    try { origConsole.error("[fileLogger] report log append failed", e?.message ?? e); } catch (_) {}
+  }
+}
+
+/**
+ * Log raw incoming payload BEFORE any filtering/handler logic.
+ * Written to both the main log and the dedicated tb-receiver-report log.
+ */
+function logRawReportPayload({ client, path, bytes, payload }) {
+  if (!opts.enabled) return;
+  try {
+    const entry = JSON.stringify({
+      outcome: "raw_received",
+      client: client || "",
+      path: path || "",
+      bytes: bytes ?? null,
+      payload,
+    });
+    appendLine(`[webhook-raw] ${entry}`);
+    appendToReportLog(`[RAW] ${entry}`);
+  } catch (_) {}
+}
+
 /**
  * One line per HTTP handling of POST /tb-active-receiver/report (or configured path).
+ * Also mirrors to the dedicated report log.
  */
 function logTbReceiverWebhook(event) {
   if (!opts.enabled) return;
   try {
     const line = `[webhook] ${JSON.stringify(event)}`;
     appendLine(line);
+    appendToReportLog(line);
   } catch (_) {
     /* ignore */
   }
@@ -170,4 +206,5 @@ module.exports = {
   summarizeWebhookResponse,
   logTbReceiverRequestReceived,
   logTbReceiverWebhook,
+  logRawReportPayload,
 };

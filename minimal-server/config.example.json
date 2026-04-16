@@ -1,12 +1,7 @@
 {
-  "logging": {
-    "enabled": true,
-    "directory": "log",
-    "mirror_console": true
-  },
   "notion": {
-    "token": "secret_xxx_or_ntn_xxx",
-    "database_id": "00000000-0000-0000-0000-000000000000",
+    "token": "xxxxxxxxxxxxx",
+    "database_id": "xxxxxxxxxxxx",
     "notion_version": "2022-06-28",
     "key_person_database_id": ""
   },
@@ -15,6 +10,7 @@
     "mode": "both",
     "enable_outbound": true,
     "enable_inbound": false,
+    "init_resolver_cache_on_startup": true,
     "poll_interval_ms": 60000,
     "page_size": 20,
     "max_scan_rows": 200,
@@ -31,6 +27,7 @@
     "tb_receiver_report_path": "/tb-active-receiver/report",
     "tb_receiver_webhook_secret": "",
     "tb_report_max_body_bytes": 104857600,
+    "address_book_id": "",
     "notion_property_names": {
       "Status": "OutReach Status",
       "subject": "Outreach Subject",

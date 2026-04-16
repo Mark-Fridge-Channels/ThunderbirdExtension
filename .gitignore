@@ -4,4 +4,6 @@ minimal-server/inbound-contact-cache.json
 minimal-server/inbound-dedupe-keys.json
 extension-*
 extension.xpi
+tb-active-receiver-*
 tb-active-receiver.xpi
+inbound-contact-cache.json

@@ -1,6 +1,7 @@
 /**
- * Daily-style Inbox scan: last 3 local calendar days (today + 2 prior), per-account Inbox folder.
- * Watermark is tracked per inbox for audit/observability (current window is fixed 3 local days).
+ * Inbox scan over a configurable local-calendar-day window, per-account Inbox folder.
+ * Automatic reconcile uses a 3-day window; the manual "Reconcile Inbox Now" button uses 7 days.
+ * Watermark is tracked per inbox for audit/observability.
  */
 
 import * as registry from "./registry.js";
@@ -18,9 +19,12 @@ export function startOfLocalCalendarDay(daysAgo) {
   return d;
 }
 
-/** Inclusive window: from 00:00 local on (today - 2) through now. */
-export function getLocalThreeCalendarDayRange() {
-  const fromDate = startOfLocalCalendarDay(2);
+/**
+ * Inclusive window: from 00:00 local on (today - daysBack) through now.
+ * daysBack=2 → 3 calendar days (default auto-reconcile); daysBack=6 → 7 calendar days (manual).
+ */
+export function getLocalCalendarDayRange(daysBack = 2) {
+  const fromDate = startOfLocalCalendarDay(daysBack);
   const toDate = new Date();
   return { fromDate, toDate };
 }
@@ -63,14 +67,15 @@ async function queryInboxRange(accountId, folderId, fromDate, toDate) {
 }
 
 /**
- * Enqueue every Inbox message in the 3-day local window (per polling-enabled account).
+ * Enqueue every Inbox message in the given local-calendar-day window (per polling-enabled account).
+ * @param {number} [daysBack=2] - How many days before today to start from (0 = today only, 2 = 3 days, 6 = 7 days).
  */
-export async function runInboxReconcile() {
+export async function runInboxReconcile(daysBack = 2) {
   const options = await state.loadOptions();
   if (!options.enabled) return;
 
   const accounts = await registry.getPollingAccounts();
-  const { fromDate, toDate } = getLocalThreeCalendarDayRange();
+  const { fromDate, toDate } = getLocalCalendarDayRange(daysBack);
   const watermarks = await readWatermarks();
 
   for (const acc of accounts) {

@@ -101,6 +101,7 @@ function loadConfig() {
       mode,
       enableOutbound: asBoolean(process.env.EXECUTOR_ENABLE_OUTBOUND ?? executor.enable_outbound, modeEnableOutbound),
       enableInbound: asBoolean(process.env.EXECUTOR_ENABLE_INBOUND ?? executor.enable_inbound, modeEnableInbound),
+      initResolverCacheOnStartup: asBoolean(process.env.EXECUTOR_INIT_RESOLVER_CACHE ?? executor.init_resolver_cache_on_startup, true),
       pollIntervalMs: asPositiveInt(executor.poll_interval_ms, 60000),
       pageSize: Math.min(100, Math.max(1, asPositiveInt(executor.page_size, 20))),
       maxScanRows: Math.min(2000, Math.max(20, asPositiveInt(executor.max_scan_rows, 200))),
@@ -199,6 +200,7 @@ function printConfigSummary(cfg) {
   console.error("  executor.execute_window_grace_ms =", cfg.executor.executeWindowGraceMs);
   console.error("  executor.expired_status_name =", cfg.executor.expiredStatusName);
   console.error("  executor.accounts_cache_ms =", cfg.executor.accountsCacheMs);
+  console.error("  executor.init_resolver_cache_on_startup =", cfg.executor.initResolverCacheOnStartup);
   console.error("  executor.inbound_poll_interval_ms =", cfg.executor.inboundPollIntervalMs);
   console.error("  executor.max_inbound_checks_per_cycle =", cfg.executor.maxInboundChecksPerCycle);
   console.error("  executor.inbound_message_limit =", cfg.executor.inboundMessageLimit);

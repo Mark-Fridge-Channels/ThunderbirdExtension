@@ -128,6 +128,44 @@ export async function fetchNowCurrentAccount() {
   }
 }
 
+async function debugLogInboxMessages() {
+  const accounts = await registry.getPollingAccounts();
+  console.log("[TB Active Receiver] --- Inbox Debug Log Start ---");
+  for (const acc of accounts) {
+    if (!acc.inboxFolderId) continue;
+    console.log(`[TB Active Receiver] Account: ${acc.name || acc.accountId} (${acc.type})`);
+    try {
+      // Paginate through all messages in the inbox
+      const allMessages = [];
+      let page = await browser.messages.query({ folderId: acc.inboxFolderId });
+      while (page) {
+        if (page.messages) allMessages.push(...page.messages);
+        if (page.id) {
+          page = await browser.messages.continueList(page.id);
+        } else {
+          break;
+        }
+      }
+      if (allMessages.length > 0) {
+        const sortedMessages = allMessages.sort((a, b) => {
+          const dateA = a.date ? new Date(a.date).getTime() : 0;
+          const dateB = b.date ? new Date(b.date).getTime() : 0;
+          return dateB - dateA;
+        });
+        for (const m of sortedMessages) {
+          const dateStr = m.date ? new Date(m.date).toLocaleString() : 'Unknown Date';
+          console.log(`  - [${dateStr}] Subject: ${m.subject} | From: ${m.author}`);
+        }
+      } else {
+        console.log(`  (No messages found in inbox)`);
+      }
+    } catch (e) {
+      console.warn(`[TB Active Receiver] Failed to read messages for ${acc.name || acc.accountId}:`, e?.message ?? e);
+    }
+  }
+  console.log("[TB Active Receiver] --- Inbox Debug Log End ---");
+}
+
 async function reattachNewMailListener() {
   const options = await state.loadOptions();
   if (detachNewMail) {
@@ -239,7 +277,14 @@ export function registerAlarmAndMessageHandlers() {
     }
 
     if (msg.type === "tbActiveRx.reconcileInboxNow") {
-      runInboxReconcile()
+      runInboxReconcile(6)  // manual: 7-day window (today + 6 prior days)
+        .then(() => sendResponse({ ok: true }))
+        .catch((e) => sendResponse({ ok: false, error: e?.message ?? String(e) }));
+      return true;
+    }
+
+    if (msg.type === "tbActiveRx.debugLogInbox") {
+      debugLogInboxMessages()
         .then(() => sendResponse({ ok: true }))
         .catch((e) => sendResponse({ ok: false, error: e?.message ?? String(e) }));
       return true;

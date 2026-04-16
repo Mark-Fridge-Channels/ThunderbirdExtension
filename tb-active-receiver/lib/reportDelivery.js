@@ -132,6 +132,9 @@ export async function drainReportQueue(maxJobs = 25) {
       }
       const post = await postReport(reportUrl, body, secret);
       if (post.ok) {
+        console.log(
+          `[TB Active Receiver] report sent: messageId=${job.messageId} account=${job.accountId} reason=${job.reason} status=${post.status}`
+        );
         q.shift();
         await writeQueue(q);
         const ack = pruneAck(await readAck());
