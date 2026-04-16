@@ -1,6 +1,6 @@
 /**
  * Inbox scan over a configurable local-calendar-day window, per-account Inbox folder.
- * Automatic reconcile uses a 3-day window; the manual "Reconcile Inbox Now" button uses 7 days.
+ * Automatic reconcile uses a 3-day window; manual "Reconcile Inbox Now" scans the entire Inbox (no date filter).
  * Watermark is tracked per inbox for audit/observability.
  */
 
@@ -21,7 +21,7 @@ export function startOfLocalCalendarDay(daysAgo) {
 
 /**
  * Inclusive window: from 00:00 local on (today - daysBack) through now.
- * daysBack=2 → 3 calendar days (default auto-reconcile); daysBack=6 → 7 calendar days (manual).
+ * daysBack=2 → 3 calendar days (default auto-reconcile / alarm).
  */
 export function getLocalCalendarDayRange(daysBack = 2) {
   const fromDate = startOfLocalCalendarDay(daysBack);
@@ -43,16 +43,16 @@ async function writeWatermarks(map) {
 }
 
 /**
- * Query all messages in Inbox between fromDate and toDate (paginated).
+ * Query all messages in Inbox (paginated). When both dates are omitted, every message in the folder is included.
  */
 async function queryInboxRange(accountId, folderId, fromDate, toDate) {
   const queryInfo = {
     accountId,
     folderId,
-    fromDate,
-    toDate,
     messagesPerPage: 100,
   };
+  if (fromDate != null) queryInfo.fromDate = fromDate;
+  if (toDate != null) queryInfo.toDate = toDate;
   const out = [];
   let page = await browser.messages.query(queryInfo);
   while (true) {
@@ -67,15 +67,19 @@ async function queryInboxRange(accountId, folderId, fromDate, toDate) {
 }
 
 /**
- * Enqueue every Inbox message in the given local-calendar-day window (per polling-enabled account).
- * @param {number} [daysBack=2] - How many days before today to start from (0 = today only, 2 = 3 days, 6 = 7 days).
+ * Enqueue every Inbox message (per polling-enabled account).
+ * @param {number} [daysBack=2] - How many days before today to start from (0 = today only, 2 = 3 days). Ignored when `entireInbox` is true.
+ * @param {{ entireInbox?: boolean }} [opts] - If true, query the full Inbox with no date bounds (manual reconcile).
  */
-export async function runInboxReconcile(daysBack = 2) {
+export async function runInboxReconcile(daysBack = 2, opts = {}) {
+  const { entireInbox = false } = opts;
   const options = await state.loadOptions();
   if (!options.enabled) return;
 
   const accounts = await registry.getPollingAccounts();
-  const { fromDate, toDate } = getLocalCalendarDayRange(daysBack);
+  const { fromDate, toDate } = entireInbox
+    ? { fromDate: undefined, toDate: undefined }
+    : getLocalCalendarDayRange(daysBack);
   const watermarks = await readWatermarks();
 
   for (const acc of accounts) {
@@ -99,5 +103,5 @@ export async function runInboxReconcile(daysBack = 2) {
   }
 
   await writeWatermarks(watermarks);
-  await drainReportQueue(300);
+  await drainReportQueue(1000);
 }

@@ -277,7 +277,7 @@ export function registerAlarmAndMessageHandlers() {
     }
 
     if (msg.type === "tbActiveRx.reconcileInboxNow") {
-      runInboxReconcile(6)  // manual: 7-day window (today + 6 prior days)
+      runInboxReconcile(undefined, { entireInbox: true })
         .then(() => sendResponse({ ok: true }))
         .catch((e) => sendResponse({ ok: false, error: e?.message ?? String(e) }));
       return true;

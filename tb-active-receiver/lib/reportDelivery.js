@@ -9,7 +9,7 @@ const browser = globalThis.browser ?? globalThis.messenger;
 
 const QUEUE_KEY = "tbActiveReceiverReportQueue";
 const ACK_KEY = "tbActiveReceiverReportAckIds";
-const MAX_QUEUE = 4000;
+const MAX_QUEUE = 1000;
 const ACK_RETAIN_MS = 8 * 24 * 60 * 60 * 1000;
 const MAX_ATTEMPTS = 50;
 
