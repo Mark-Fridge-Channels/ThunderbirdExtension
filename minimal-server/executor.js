@@ -607,7 +607,7 @@ async function initResolverCache(cfg) {
   const outRows = [];
   
   try {
-    while (outRows.length < 500) {
+    while (outRows.length < 5000) {
       const data = await queryDatabase(notionCfg, databaseId, {
         pageSize: 100,
         sorts,
