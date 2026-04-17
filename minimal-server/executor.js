@@ -25,6 +25,15 @@ const keyPersonEmailCache = new Map();
 
 /** Inbound contact cache persisted in JSON (permanent, first-write wins). */
 let inboundContactCacheState = null;
+/** Outbound attribution cache for unknown-sender inbound matching. */
+let outboundAttributionCacheState = null;
+
+const OUTBOUND_ATTRIBUTION_WINDOW_DAYS = 30;
+const OUTBOUND_ATTRIBUTION_MAX_ROWS = 5000;
+const OUTBOUND_ATTRIBUTION_MIN_BODY_LEN = 80;
+const OUTBOUND_ATTRIBUTION_MAX_BODY_LEN = 2500;
+const OUTBOUND_ATTRIBUTION_KEY_LINES_LIMIT = 5;
+const OUTBOUND_ATTRIBUTION_MIN_ENTITY_OVERLAP = 2;
 
 function nowIso() {
   return new Date().toISOString();
@@ -354,6 +363,214 @@ function normalizeMessageId(id) {
   return String(id || "").trim().replace(/^<+|>+$/g, "").trim();
 }
 
+function canonicalTextForContains(input) {
+  return String(input || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/\u00a0/g, " ")
+    .replace(/^\s*>+\s?/gm, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function dropReplySignatures(raw) {
+  const s = String(raw || "");
+  if (!s) return "";
+  const patterns = [
+    /\n--\s*\n[\s\S]*$/i,
+    /\nbest\s*,[\s\S]*$/i,
+    /\nregards\s*,[\s\S]*$/i,
+    /\nkind regards\s*,[\s\S]*$/i,
+    /\nthanks\s*,[\s\S]*$/i,
+  ];
+  for (const re of patterns) {
+    if (re.test(s)) return s.replace(re, "").trim();
+  }
+  return s.trim();
+}
+
+function normalizeBodyForAttribution(rawBody) {
+  const stripped = stripHtmlToPlain(rawBody);
+  const deSig = dropReplySignatures(stripped);
+  return deSig.length > OUTBOUND_ATTRIBUTION_MAX_BODY_LEN
+    ? deSig.slice(0, OUTBOUND_ATTRIBUTION_MAX_BODY_LEN)
+    : deSig;
+}
+
+function extractKeyLinesFromBody(bodyText) {
+  const lines = String(bodyText || "")
+    .split(/\n+/)
+    .map((x) => x.trim())
+    .filter(Boolean)
+    .filter((x) => x.length >= 24)
+    .map((x) => canonicalTextForContains(x));
+  return lines.slice(0, OUTBOUND_ATTRIBUTION_KEY_LINES_LIMIT);
+}
+
+function normalizeEntityToken(token) {
+  return String(token || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\u4e00-\u9fff&+\-.'\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractEntitiesFromText(subject, body, authorText = "") {
+  const blob = `${subject || ""}\n${body || ""}\n${authorText || ""}`;
+  const out = new Set();
+  const add = (raw) => {
+    const t = normalizeEntityToken(raw);
+    if (!t) return;
+    if (t.length < 3) return;
+    if (!/[a-z\u4e00-\u9fff]/i.test(t)) return;
+    const words = t.split(" ").filter(Boolean);
+    if (words.length > 8) return;
+    out.add(t);
+  };
+
+  const quotedRe = /["“”'‘’]([^"“”'‘’]{3,120})["“”'‘’]/g;
+  let m;
+  while ((m = quotedRe.exec(blob)) != null) add(m[1]);
+
+  const titleRe = /\b([A-Z][a-z]+(?:[\s-]+[A-Z][a-z]+){0,5})\b/g;
+  while ((m = titleRe.exec(blob)) != null) add(m[1]);
+
+  const orgRe = /\b([A-Z][A-Za-z0-9&+\-]{1,}(?:\s+[A-Z][A-Za-z0-9&+\-]{1,}){0,5})\b/g;
+  while ((m = orgRe.exec(blob)) != null) add(m[1]);
+
+  // CJK phrases help reduce misses for non-English email content.
+  const cjkRe = /([\u4e00-\u9fff]{2,12})/g;
+  while ((m = cjkRe.exec(blob)) != null) add(m[1]);
+
+  // Lowercase multi-word phrases from subject (e.g. "fridge channels") can still be business entities.
+  const subjectNorm = canonicalTextForContains(subject);
+  const phraseRe = /\b([a-z][a-z0-9]+(?:\s+[a-z][a-z0-9]+){1,4})\b/g;
+  while ((m = phraseRe.exec(subjectNorm)) != null) add(m[1]);
+
+  const emailDomain = extractEmail(authorText).split("@")[1] || "";
+  if (emailDomain && !["gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "qq.com", "163.com", "icloud.com"].includes(emailDomain)) {
+    add(emailDomain.replace(/\.[a-z]{2,}$/i, "").replace(/[.-]+/g, " "));
+  }
+  return Array.from(out).slice(0, 30);
+}
+
+function subjectContainsMatch(inboundSubjectNorm, outboundSubjectNorm) {
+  if (!inboundSubjectNorm || !outboundSubjectNorm) return false;
+  return inboundSubjectNorm.includes(outboundSubjectNorm) || outboundSubjectNorm.includes(inboundSubjectNorm);
+}
+
+function bodyContainsMatch(inboundBodyNorm, outboundBodyNorm) {
+  if (!inboundBodyNorm || !outboundBodyNorm) return false;
+  if (outboundBodyNorm.length < OUTBOUND_ATTRIBUTION_MIN_BODY_LEN) return false;
+  return inboundBodyNorm.includes(outboundBodyNorm);
+}
+
+function bodyContainsByKeyLines(inboundBodyNorm, outboundKeyLines) {
+  if (!inboundBodyNorm) return false;
+  const lines = Array.isArray(outboundKeyLines) ? outboundKeyLines : [];
+  for (const line of lines) {
+    const one = canonicalTextForContains(line);
+    if (one && one.length >= 24 && inboundBodyNorm.includes(one)) return true;
+  }
+  return false;
+}
+
+function entityOverlap(inboundEntities, outboundEntities) {
+  const a = new Set((inboundEntities || []).map(normalizeEntityToken).filter(Boolean));
+  const b = new Set((outboundEntities || []).map(normalizeEntityToken).filter(Boolean));
+  let cnt = 0;
+  const overlap = [];
+  for (const x of a) {
+    if (b.has(x)) {
+      overlap.push(x);
+      cnt += 1;
+    }
+  }
+  return { count: cnt, overlap };
+}
+
+function buildOutboundAttributionRecordFromRow(row, authoredAt) {
+  const entityId = String(row?.entityPageId || row?.keyPersonPageId || "").trim();
+  if (!entityId) return null;
+  const fcAccount = normalizeEmail(row?.fcAccount);
+  if (!fcAccount) return null;
+  const subject = String(row?.subject || "").trim();
+  const subjectNorm = normalizeSubjectForMatch(subject);
+  const bodyCore = normalizeBodyForAttribution(row?.body || row?.payload?.body || "");
+  const keyLines = extractKeyLinesFromBody(bodyCore);
+  const entities = extractEntitiesFromText(subject, bodyCore);
+  return {
+    outboundPageId: String(row?.pageId || "").trim(),
+    entityId,
+    fcAccount,
+    authoredAt: authoredAt || nowIso(),
+    subject,
+    subjectNorm,
+    bodyCore,
+    keyLines,
+    entities,
+  };
+}
+
+function getOutboundAttributionCachePath() {
+  return path.join(__dirname, ".cache", "outbound-attribution-cache.json");
+}
+
+function getAttributionMatchLogPath(cfg) {
+  const base = cfg?.logging?.directory && String(cfg.logging.directory).trim()
+    ? String(cfg.logging.directory).trim()
+    : "log";
+  const dir = path.isAbsolute(base) ? base : path.join(__dirname, base);
+  return path.join(dir, "attribution-match.log");
+}
+
+function appendAttributionMatchLog(cfg, payload) {
+  try {
+    const p = getAttributionMatchLogPath(cfg);
+    const dir = path.dirname(p);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(p, `${JSON.stringify({ at: nowIso(), ...payload })}\n`, "utf8");
+  } catch (e) {
+    console.error("[executor][attribution] log write failed", e?.message ?? e);
+  }
+}
+
+function readOutboundAttributionCacheFresh() {
+  const cachePath = getOutboundAttributionCachePath();
+  const out = { path: cachePath, items: [] };
+  try {
+    const raw = fs.readFileSync(cachePath, "utf8");
+    const parsed = JSON.parse(raw);
+    const items = Array.isArray(parsed?.items) ? parsed.items : [];
+    out.items = items.filter((x) => x && typeof x === "object");
+  } catch (_) {
+    /* missing cache */
+  }
+  return out;
+}
+
+function saveOutboundAttributionCache(state) {
+  if (!state?.path) return;
+  const dir = path.dirname(state.path);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    state.path,
+    JSON.stringify(
+      {
+        version: 1,
+        updatedAt: nowIso(),
+        windowDays: OUTBOUND_ATTRIBUTION_WINDOW_DAYS,
+        items: Array.isArray(state.items) ? state.items : [],
+      },
+      null,
+      2
+    ),
+    "utf8"
+  );
+}
+
 function getInboundCachePath(cfg) {
   const p = String(cfg?.executor?.inboundContactCachePath || "").trim();
   if (!p) return path.join(__dirname, "inbound-contact-cache.json");
@@ -531,6 +748,172 @@ function appendInboundCacheEntriesFromSendSuccess(cfg, row, partnerEmailResolved
   saveInboundContactCache(state);
   inboundContactCacheState = null;
   console.error("[executor] inbound contact cache updated after send", { fcAccount: fc, added, totalKeys: state.byKey.size });
+}
+
+function appendOutboundAttributionFromSendSuccess(row) {
+  const cache = readOutboundAttributionCacheFresh();
+  const record = buildOutboundAttributionRecordFromRow(row, nowIso());
+  if (!record) return;
+  const current = Array.isArray(cache.items) ? cache.items : [];
+  const filtered = current.filter(
+    (x) => String(x?.outboundPageId || "").trim() !== record.outboundPageId
+  );
+  filtered.push(record);
+  filtered.sort((a, b) => Date.parse(String(b?.authoredAt || "")) - Date.parse(String(a?.authoredAt || "")));
+  const cutoffMs = Date.now() - OUTBOUND_ATTRIBUTION_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+  const trimmed = filtered.filter((x) => {
+    const t = Date.parse(String(x?.authoredAt || ""));
+    return Number.isFinite(t) && t >= cutoffMs;
+  });
+  const next = { path: cache.path, items: trimmed.slice(0, OUTBOUND_ATTRIBUTION_MAX_ROWS) };
+  saveOutboundAttributionCache(next);
+  outboundAttributionCacheState = null;
+}
+
+async function queryRecentSuccessOutRowsForAttribution(cfg) {
+  const notionCfg = { token: cfg.notion.token, notionVersion: cfg.notion.notionVersion };
+  const databaseId = cfg.notion.databaseId;
+  const statusCol = String(cfg.executor?.notionPropertyNames?.Status || "OutReach Status").trim() || "OutReach Status";
+  const executedAtProp =
+    String(cfg.executor?.notionPropertyNames?.executed_at || "Completion Time").trim() || "Completion Time";
+  const cutoffIso = new Date(Date.now() - OUTBOUND_ATTRIBUTION_WINDOW_DAYS * 24 * 60 * 60 * 1000).toISOString();
+  const filter = {
+    and: [
+      { property: "Platform", select: { equals: "Email" } },
+      { property: "InNOut", select: { equals: "Out" } },
+      {
+        or: [
+          { property: "Action", select: { equals: "Send Email" } },
+          { property: "Action", select: { equals: "Reply Email" } },
+        ],
+      },
+      { property: statusCol, status: { equals: "Success" } },
+      { property: executedAtProp, date: { on_or_after: cutoffIso } },
+    ],
+  };
+
+  const outRows = [];
+  let cursor = undefined;
+  while (outRows.length < OUTBOUND_ATTRIBUTION_MAX_ROWS) {
+    const data = await queryDatabase(notionCfg, databaseId, {
+      pageSize: 100,
+      filter,
+      sorts: [{ property: executedAtProp, direction: "descending" }],
+      startCursor: cursor,
+    });
+    const chunk = Array.isArray(data?.results) ? data.results : [];
+    for (const p of chunk) {
+      try {
+        outRows.push(parseQueueRow(p));
+      } catch (_) {
+        /* skip malformed row */
+      }
+    }
+    if (!data?.has_more || !data?.next_cursor || chunk.length === 0) break;
+    cursor = data.next_cursor;
+  }
+  return outRows.slice(0, OUTBOUND_ATTRIBUTION_MAX_ROWS);
+}
+
+async function initOutboundAttributionCache(cfg) {
+  try {
+    const outRows = await queryRecentSuccessOutRowsForAttribution(cfg);
+    const items = [];
+    for (const row of outRows) {
+      const authoredAt = row?.completionTime
+        ? new Date(row.completionTime).toISOString()
+        : nowIso();
+      const rec = buildOutboundAttributionRecordFromRow(row, authoredAt);
+      if (rec) items.push(rec);
+    }
+    const state = {
+      path: getOutboundAttributionCachePath(),
+      items: items.slice(0, OUTBOUND_ATTRIBUTION_MAX_ROWS),
+    };
+    saveOutboundAttributionCache(state);
+    outboundAttributionCacheState = null;
+    console.error("[executor] initOutboundAttributionCache completed", {
+      rows: outRows.length,
+      cached: state.items.length,
+      path: state.path,
+    });
+  } catch (e) {
+    console.error("[executor] initOutboundAttributionCache failed", e?.message ?? e);
+  }
+}
+
+function matchUnknownInboundByThreeSignals({ cfg, payload, fcAccount }) {
+  const cache = outboundAttributionCacheState || readOutboundAttributionCacheFresh();
+  outboundAttributionCacheState = cache;
+  const inboundSubjectNorm = normalizeSubjectForMatch(payload?.subject || "");
+  const inboundBodyRaw =
+    (typeof payload?.bodyPlain === "string" && payload.bodyPlain.trim())
+      ? payload.bodyPlain
+      : stripHtmlToPlain(payload?.bodyHtml || "");
+  const inboundBodyNorm = canonicalTextForContains(inboundBodyRaw);
+  const inboundEntities = extractEntitiesFromText(payload?.subject || "", inboundBodyRaw, payload?.author || "");
+
+  const candidates = (cache.items || [])
+    .filter((x) => normalizeEmail(x?.fcAccount) === normalizeEmail(fcAccount))
+    .slice(0, OUTBOUND_ATTRIBUTION_MAX_ROWS);
+
+  const inspected = [];
+  const passed = [];
+
+  for (const c of candidates) {
+    const subjHit = subjectContainsMatch(inboundSubjectNorm, normalizeSubjectForMatch(c?.subjectNorm || c?.subject || ""));
+    const outboundBodyNorm = canonicalTextForContains(c?.bodyCore || "");
+    const bodyHit = bodyContainsMatch(inboundBodyNorm, outboundBodyNorm) || bodyContainsByKeyLines(inboundBodyNorm, c?.keyLines);
+    const overlap = entityOverlap(inboundEntities, c?.entities || []);
+    const entityHit = overlap.count >= OUTBOUND_ATTRIBUTION_MIN_ENTITY_OVERLAP;
+    const allHit = subjHit && bodyHit && entityHit;
+
+    const one = {
+      outboundPageId: c?.outboundPageId || "",
+      entityId: c?.entityId || "",
+      authoredAt: c?.authoredAt || "",
+      subjectHit: subjHit,
+      bodyHit,
+      entityHit,
+      entityOverlapCount: overlap.count,
+      overlapEntities: overlap.overlap.slice(0, 8),
+      keyLineCount: Array.isArray(c?.keyLines) ? c.keyLines.length : 0,
+      subject: c?.subject || "",
+    };
+    inspected.push(one);
+    if (allHit) passed.push({ ...one, source: c });
+  }
+
+  passed.sort((a, b) => Date.parse(String(b?.authoredAt || "")) - Date.parse(String(a?.authoredAt || "")));
+  const winner = passed[0] || null;
+
+  appendAttributionMatchLog(cfg, {
+    kind: "three_signal_match",
+    inbound: {
+      fcAccount: normalizeEmail(fcAccount),
+      author: payload?.author || "",
+      subject: payload?.subject || "",
+      headerMessageId: payload?.headerMessageId || "",
+      messageId: payload?.messageId || "",
+      inboundEntities,
+    },
+    summary: {
+      candidateCount: candidates.length,
+      passCount: passed.length,
+      matched: !!winner,
+      matchedOutboundPageId: winner?.outboundPageId || "",
+      matchedEntityId: winner?.entityId || "",
+    },
+    inspectedTop: inspected.slice(0, 10),
+  });
+
+  if (!winner) return null;
+  return {
+    entityId: winner.entityId,
+    outboundPageId: winner.outboundPageId,
+    matchReason: "three_signal_match",
+    classification: "Human Reply Stranger Attribution",
+  };
 }
 
 /** Read contact cache JSON from disk (fresh read for webhook; does not use in-memory cache). */
@@ -1518,6 +1901,14 @@ async function successWriteback({ cfg, row, detail, externalEventId, payloadText
   } catch (e) {
     console.error("[executor] inbound cache update after success failed", { taskId: row.taskId, error: e?.message ?? e });
   }
+  try {
+    appendOutboundAttributionFromSendSuccess(row);
+  } catch (e) {
+    console.error("[executor] outbound attribution cache update after success failed", {
+      taskId: row.taskId,
+      error: e?.message ?? e,
+    });
+  }
   return { kind: "written", ok: true };
 }
 
@@ -2121,7 +2512,21 @@ async function handleTbActiveReceiverWebhook(cfg, payload, reqHeaders = {}) {
   }
 
   if (!entityId) {
-    return { status: 200, body: { ok: true, skipped: true, reason: "not_in_contact_cache_or_domain" } };
+    const unknownMatch = matchUnknownInboundByThreeSignals({
+      cfg,
+      payload,
+      fcAccount: fc,
+    });
+    if (unknownMatch) {
+      entityId = unknownMatch.entityId;
+      outboundPageId = unknownMatch.outboundPageId || "";
+      matchReason = unknownMatch.matchReason;
+      classification = unknownMatch.classification;
+    }
+  }
+
+  if (!entityId) {
+    return { status: 200, body: { ok: true, skipped: true, reason: "not_matched_after_three_signals" } };
   }
 
   const notionCfg = { token: cfg.notion.token, notionVersion: cfg.notion.notionVersion };
@@ -2206,6 +2611,11 @@ async function startExecutor({ cfg, enqueueAndWait }) {
      await initResolverCache(cfg);
   } catch (e) {
      console.error("[executor] initResolverCache failed:", e?.message ?? e);
+  }
+  try {
+    await initOutboundAttributionCache(cfg);
+  } catch (e) {
+    console.error("[executor] initOutboundAttributionCache failed:", e?.message ?? e);
   }
 
   // Initial delay is 0: run immediately on boot.
