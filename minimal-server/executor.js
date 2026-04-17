@@ -2585,7 +2585,16 @@ async function handleTbActiveReceiverWebhook(cfg, payload, reqHeaders = {}) {
       classification,
       matchReason
     });
-    return { status: 201, body: { ok: true, entityId, matchReason } };
+    return {
+      status: 201,
+      body: {
+        ok: true,
+        entityId,
+        matchReason,
+        classification,
+        outboundPageId: outboundPageId || "",
+      },
+    };
   } catch (e) {
     console.error("[executor][webhook] appendBlockChildren failed", e?.message ?? e);
     return { status: 502, body: { ok: false, error: "notion_append_failed", detail: e?.message ?? String(e) } };

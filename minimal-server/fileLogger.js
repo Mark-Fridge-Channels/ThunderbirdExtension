@@ -123,6 +123,10 @@ function summarizeWebhookResponse(body) {
     skipped: body.skipped,
     reason: body.reason,
     error: body.error,
+    entityId: body.entityId,
+    matchReason: body.matchReason,
+    classification: body.classification,
+    outboundPageId: body.outboundPageId,
     pageId: body.pageId,
     detail: typeof body.detail === "string" ? body.detail.slice(0, 300) : body.detail,
   };
