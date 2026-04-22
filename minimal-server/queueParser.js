@@ -281,11 +281,20 @@ function parseQueueRow(page) {
   const dependsOnTaskId = readPropertyText(props, ["depends_on_task_id", "dependsOnTaskId"]);
   const externalEventId = readPropertyText(props, ["external_event_id", "External Event Id", "External Event ID"]);
 
+  const replyEmailColumn = readEmailValue(
+    firstDefined(props, [
+      "Reply Email",
+      "Reply email",
+      "reply_email",
+    ])
+  );
+  /** Payload 优先；无 KeyPerson 或不上传 JSON 时可用 Notion「Reply Email」列（email 类型）作对方地址 */
   const counterpartyEmail = normalizeEmail(
     firstNonEmpty(
       payload?.to_email,
       Array.isArray(payload?.to) ? String(payload.to[0] || "") : String(payload?.to || ""),
-      payload?.counterpartyEmail
+      payload?.counterpartyEmail,
+      replyEmailColumn
     )
   );
 

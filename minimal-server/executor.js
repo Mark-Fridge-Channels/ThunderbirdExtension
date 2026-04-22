@@ -284,20 +284,28 @@ async function getDependencyOutreachStatus(notionCfg, dependsOnPageId, outreachS
   }
 }
 
+/**
+ * 对方邮箱：优先 KeyPerson 页的 `Email`；无关系 / 取不到时回退到 Payload/「Reply Email」列解析的 `row.counterpartyEmail`。
+ * Reply Email 发信本身只依赖 message 定位，此处主要为回写/联系人缓存/校验 Send。
+ */
 async function resolveKeyPersonEmail(notionCfg, row) {
-  if (!row.keyPersonPageId) return normalizeEmail(row.counterpartyEmail);
+  const fallback = normalizeEmail(row.counterpartyEmail);
+  if (!row.keyPersonPageId) return fallback;
   const key = row.keyPersonPageId;
-  if (keyPersonEmailCache.has(key)) return keyPersonEmailCache.get(key);
+  if (keyPersonEmailCache.has(key)) {
+    const cached = keyPersonEmailCache.get(key);
+    return (cached && String(cached).trim()) || fallback;
+  }
   try {
     const page = await getPage(notionCfg, key);
     const raw = readEmailValue(page?.properties?.Email);
     const em = normalizeEmail(raw);
     keyPersonEmailCache.set(key, em);
-    return em;
+    return (em && String(em).trim()) || fallback;
   } catch (e) {
     console.error("[executor] KeyPerson Email fetch failed", { keyPersonPageId: key, error: e?.message ?? e });
     keyPersonEmailCache.set(key, "");
-    return "";
+    return fallback;
   }
 }
 
@@ -306,6 +314,7 @@ async function resolveKeyPersonEmail(notionCfg, row) {
  * - `messageId`：Thunderbird 内部消息 id（数字，扩展 `replyEmail` 首选）
  * - `headerMessageId` 和/或 `replyToHeaderMessageId`：RFC Message-ID 字符串，供 executor `findMessages` 在 Inbox 解析
  * 不要求在 Payload 中保存原信 subject/body；执行时由 `mapActionToEnvelope` 用占位正文满足扩展非空校验。
+ * 对方邮箱不必依赖 KeyPerson：可与「Reply Email」列、Payload 中 `to_email`/`counterpartyEmail` 对齐（见 `parseQueueRow` + `resolveKeyPersonEmail`）。
  */
 function validateRequired(row, partnerEmailResolved) {
   const t = (row.actionText || "").trim();
