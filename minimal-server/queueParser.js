@@ -262,7 +262,12 @@ function parseQueueRow(page) {
     body = richTextPropertyToHtml(bodyProp);
     bodySourceFormat = "html";
   } else {
-    body = firstNonEmpty(readRichText(bodyProp), payload?.body);
+    // Reply/Send: prefer column; Inbound-LOG rows often put received text in Payload only (body / bodyPlain).
+    body = firstNonEmpty(
+      readRichText(bodyProp),
+      payload?.body,
+      typeof payload?.bodyPlain === "string" ? payload.bodyPlain : ""
+    );
   }
   const keyPersonPageId = readRelationFirstId(firstDefined(props, ["KeyPerson ID", "key_person_id", "keyPersonId"]));
   const entityPageId = readRelationFirstId(firstDefined(props, ["Entity Name", "entity_name", "entityName"]));
@@ -276,7 +281,13 @@ function parseQueueRow(page) {
   const dependsOnTaskId = readPropertyText(props, ["depends_on_task_id", "dependsOnTaskId"]);
   const externalEventId = readPropertyText(props, ["external_event_id", "External Event Id", "External Event ID"]);
 
-  const counterpartyEmail = normalizeEmail(payload?.to_email || payload?.to || "");
+  const counterpartyEmail = normalizeEmail(
+    firstNonEmpty(
+      payload?.to_email,
+      Array.isArray(payload?.to) ? String(payload.to[0] || "") : String(payload?.to || ""),
+      payload?.counterpartyEmail
+    )
+  );
 
   return {
     pageId: page?.id,

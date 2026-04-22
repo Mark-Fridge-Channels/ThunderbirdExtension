@@ -301,6 +301,12 @@ async function resolveKeyPersonEmail(notionCfg, row) {
   }
 }
 
+/**
+ * Reply Email 在 Notion Payload 中至少需要能 **定位要回复的那一封**（二选一或兼具）：
+ * - `messageId`：Thunderbird 内部消息 id（数字，扩展 `replyEmail` 首选）
+ * - `headerMessageId` 和/或 `replyToHeaderMessageId`：RFC Message-ID 字符串，供 executor `findMessages` 在 Inbox 解析
+ * 不要求在 Payload 中保存原信 subject/body；执行时由 `mapActionToEnvelope` 用占位正文满足扩展非空校验。
+ */
 function validateRequired(row, partnerEmailResolved) {
   const t = (row.actionText || "").trim();
   if (!t) return { ok: false, reason: "unsupported_action" };
@@ -322,8 +328,12 @@ function validateRequired(row, partnerEmailResolved) {
     if (!to) return { ok: false, reason: "missing_counterparty_mailbox_id" };
   }
   if (t === "Reply Email") {
-    if (!row.body) return { ok: false, reason: "missing_body" };
-    if (!row.replyToHeaderMessageId && !row.payload?.replyToHeaderMessageId && !row.payload?.messageId) {
+    const p = row.payload || {};
+    const hasMessageId = Number.isFinite(Number(p.messageId));
+    const hasRfc = Boolean(
+      String(row.replyToHeaderMessageId || p.replyToHeaderMessageId || p.headerMessageId || "").trim()
+    );
+    if (!hasMessageId && !hasRfc) {
       return { ok: false, reason: "missing_reply_target" };
     }
   }
@@ -1811,13 +1821,14 @@ async function runInboundWatchOnce({ cfg, enqueueAndWait }) {
 
       const matchedOut = findBestMatchingOutRow(successOutRows, matchedFc, authorEmail, target.subject || "");
       const metadataPayload = {
+        messageId: target.messageId,
         headerMessageId: target.headerMessageId || "",
+        replyToHeaderMessageId: target.headerMessageId || "",
         conversationAnchor: matchedOut?.payload?.conversationAnchor || matchedOut?.payload?.headerMessageId || target.headerMessageId || "",
         sourceOutPageId: matchedOut?.pageId || "",
-        messageId: target.messageId,
-        to_email: matchedFc,
-        from_email: authorEmail,
-        subject: target.subject || matchedOut?.subject || "",
+        to_email: authorEmail,
+        counterpartyEmail: authorEmail,
+        from_email: matchedFc,
         cacheMatched: true,
         keyPersonId: matchedCache.keyPersonId,
       };
@@ -2060,7 +2071,14 @@ function mapActionToEnvelope({ row, externalEventId, accountId, identityId, requ
   const t = row.actionText;
   const toMailbox = normalizeEmail(partnerEmail || row.counterpartyEmail);
   const effectiveBodyFormat = migratedPayload?.bodyFormat ?? row.bodySourceFormat;
-  const bodyResolved = resolveBodyForCompose(row.body, effectiveBodyFormat);
+  const rawOutreachBody = String(row.body || "").trim();
+  /** 扩展 `replyEmail` 要求 body 非空；未在 Notion 存正文时发单空格，由 TB 在 beginReply 中按原信展示。 */
+  const bodySourceForReply =
+    t === "Reply Email" && !rawOutreachBody ? " " : row.body;
+  const bodyResolved = resolveBodyForCompose(
+    t === "Reply Email" ? bodySourceForReply : row.body,
+    effectiveBodyFormat
+  );
   if (t === "Send Email") {
     return {
       ok: true,
@@ -2778,8 +2796,15 @@ async function handleTbActiveReceiverWebhook(cfg, payload, reqHeaders = {}) {
     keyPersonId = String(matchedOutForLog.keyPersonPageId || "").trim();
   }
 
+  /** 仅留「定位要回复的邮件 + 元数据」；正文/主题不必写入 Payload，执行 Reply 时由 TB 原信 + 占位 body 发信。 */
   const interactionPayload = {
-    ...payload,
+    messageId: payload.messageId,
+    headerMessageId: payload.headerMessageId ?? null,
+    replyToHeaderMessageId: payload.headerMessageId != null ? String(payload.headerMessageId) : "",
+    fcAccount: fc,
+    from_email: fc,
+    to_email: author,
+    counterpartyEmail: author,
     is_reply: true,
     is_reply_reason: replyProbe.reason,
     entity_match: {
