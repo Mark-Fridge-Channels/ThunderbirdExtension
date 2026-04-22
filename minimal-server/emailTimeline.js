@@ -26,6 +26,7 @@ const {
   listBlockChildren,
   createDatabase,
   createPageInDatabase,
+  queryDatabase,
 } = require("./notion.js");
 
 const EMAIL_TIMELINE_DB_NAME = "Email Timeline";
@@ -152,8 +153,105 @@ function dateTimeProp(date) {
   return { date: { start: iso, end: null } };
 }
 
+function readRichTextPlain(prop) {
+  if (!prop || prop.type !== "rich_text" || !Array.isArray(prop.rich_text)) return "";
+  return prop.rich_text.map((r) => (typeof r?.plain_text === "string" ? r.plain_text : "")).join("");
+}
+
+function toSecondsEpoch(v) {
+  if (v instanceof Date) {
+    const n = v.valueOf();
+    return Number.isFinite(n) ? Math.floor(n / 1000) : null;
+  }
+  if (typeof v === "string" && v.trim()) {
+    const d = new Date(v);
+    const n = d.valueOf();
+    return Number.isFinite(n) ? Math.floor(n / 1000) : null;
+  }
+  return null;
+}
+
+/** Up to this many pages scanned before giving up on the dedup lookup. */
+const DEDUP_MAX_SCAN = 200;
+
+/**
+ * Look for an existing card in the Email Timeline database whose
+ * (From, To, Subject, Date) all match the new card. Returns the page id
+ * of the first match, or null. Match is exhaustive but best-effort: Notion
+ * filters narrow by Subject+From, final comparison is done in memory so we
+ * are not sensitive to Notion's date-filter day granularity.
+ *
+ * The comparison is case-insensitive for From/To (emails), but exact for
+ * Subject (the stored, possibly truncated form). Date matches at
+ * one-second precision.
+ */
+async function findExistingTimelineCardId(cfg, databaseId, card) {
+  const notionCfg = cfg?.notion ? { token: cfg.notion.token, notionVersion: cfg.notion.notionVersion } : cfg;
+  const subjectWanted = clampText(String(card?.subject || ""), 1900);
+  const fromWantedRaw = String(card?.from || "").trim();
+  const fromWantedLower = fromWantedRaw.toLowerCase();
+  const toWantedLower = clampText(String(card?.to || "").trim(), 1900).toLowerCase();
+  const targetSec = toSecondsEpoch(card?.date instanceof Date ? card.date : card?.date || null);
+
+  const filterAnd = [];
+  filterAnd.push(
+    subjectWanted
+      ? { property: "Subject", rich_text: { equals: subjectWanted } }
+      : { property: "Subject", rich_text: { is_empty: true } }
+  );
+  filterAnd.push(
+    fromWantedRaw
+      ? { property: "From", rich_text: { equals: fromWantedRaw } }
+      : { property: "From", rich_text: { is_empty: true } }
+  );
+  const filter = { and: filterAnd };
+
+  let cursor;
+  let scanned = 0;
+  while (scanned < DEDUP_MAX_SCAN) {
+    let page;
+    try {
+      page = await queryDatabase(notionCfg, databaseId, {
+        pageSize: 50,
+        filter,
+        sorts: [{ property: "Date", direction: "descending" }],
+        startCursor: cursor,
+      });
+    } catch (e) {
+      // Notion may reject filters when the schema is missing/renamed. Re-throw so
+      // the caller can decide to proceed with a create (best-effort dedup only).
+      throw e;
+    }
+    const results = Array.isArray(page?.results) ? page.results : [];
+    for (const p of results) {
+      scanned += 1;
+      const props = p?.properties || {};
+      // From filter is case-sensitive in Notion; verify in-memory case-insensitively
+      // to catch legacy rows written with different casing.
+      const storedFrom = readRichTextPlain(props.From).trim().toLowerCase();
+      if (fromWantedLower && storedFrom && storedFrom !== fromWantedLower) continue;
+      const storedTo = readRichTextPlain(props.To).trim().toLowerCase();
+      if (storedTo !== toWantedLower) continue;
+      const storedDateStart = props?.Date?.type === "date" ? props.Date.date?.start : null;
+      const storedSec = toSecondsEpoch(storedDateStart);
+      if (targetSec != null && storedSec !== targetSec) continue;
+      if (targetSec == null && storedSec != null) continue;
+      return p?.id || null;
+    }
+    if (!page?.has_more || !page?.next_cursor) break;
+    cursor = page.next_cursor;
+  }
+  return null;
+}
+
 /**
  * Create a card (page) in the Email Timeline database for an entity.
+ *
+ * Idempotent: if a card with the same (From, To, Subject, Date) already
+ * exists on this Entity page's Email Timeline, no new row is created and
+ * the existing row's id is returned with `skipped: true, reason:
+ * "already_exists"`. This makes manual rescans (e.g. "Scan Sent Mail
+ * (entire folder)") safe to re-run without generating duplicate cards.
  *
  * @param {object} cfg minimal-server config (must expose .notion)
  * @param {string} entityPageId Notion page id of the Entity
@@ -164,13 +262,39 @@ function dateTimeProp(date) {
  * @param {string} card.to         Recipient email(s) joined by comma
  * @param {string} card.subject    Subject line
  * @param {string} card.body       Plain-text body (will be truncated)
- * @returns {Promise<{databaseId: string, pageId: string}>}
+ * @returns {Promise<{databaseId: string, pageId: string, skipped?: boolean, reason?: string}>}
  */
 async function createEmailTimelineCard(cfg, entityPageId, card) {
   const notionCfg = cfg?.notion ? { token: cfg.notion.token, notionVersion: cfg.notion.notionVersion } : cfg;
   const entityId = String(entityPageId || "").trim();
   if (!entityId) throw new Error("createEmailTimelineCard: entityPageId required");
-  const databaseId = await ensureEmailTimelineDatabase(notionCfg, entityId);
+
+  // If the inline database already exists, look for a matching row before
+  // creating. A brand-new database cannot contain a duplicate, so in that
+  // case we fall through straight to create.
+  const existingDbId = await findEmailTimelineDatabaseId(notionCfg, entityId);
+  if (existingDbId) {
+    try {
+      const dupPageId = await findExistingTimelineCardId(notionCfg, existingDbId, card);
+      if (dupPageId) {
+        return {
+          databaseId: existingDbId,
+          pageId: dupPageId,
+          skipped: true,
+          reason: "already_exists",
+        };
+      }
+    } catch (e) {
+      // Best-effort dedup only; do not block inserts when the lookup fails.
+      console.error("[emailTimeline] dedup query failed, proceeding to create", {
+        entityPageId: entityId,
+        databaseId: existingDbId,
+        error: e?.message ?? String(e),
+      });
+    }
+  }
+
+  const databaseId = existingDbId || (await createEmailTimelineDatabase(notionCfg, entityId));
   if (!databaseId) throw new Error("ensureEmailTimelineDatabase: no database id returned");
   const bodyText = clampText(card?.body || "", 1900);
   const properties = {
@@ -193,6 +317,7 @@ function clearEmailTimelineCache() {
 module.exports = {
   EMAIL_TIMELINE_DB_NAME,
   findEmailTimelineDatabaseId,
+  findExistingTimelineCardId,
   createEmailTimelineDatabase,
   ensureEmailTimelineDatabase,
   createEmailTimelineCard,

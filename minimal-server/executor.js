@@ -1722,6 +1722,20 @@ async function writeEmailTimelineCard(cfg, entityPageId, card) {
       subject,
       body: String(card?.body || ""),
     });
+    // createEmailTimelineCard may set { skipped: true, reason: "already_exists" }
+    // when the inline database already has a matching row. That still counts as
+    // a successful write-path outcome for callers (the card exists in Notion),
+    // so keep ok:true and propagate skipped/reason for diagnostics.
+    if (res?.skipped) {
+      console.error("[executor][email-timeline] dedup skip (card already exists)", {
+        entityPageId: id,
+        databaseId: res.databaseId,
+        existingPageId: res.pageId,
+        reason: res.reason,
+        subject,
+      });
+      return { ok: true, skipped: true, reason: res.reason || "already_exists", databaseId: res.databaseId, pageId: res.pageId };
+    }
     return { ok: true, ...res };
   } catch (e) {
     console.error("[executor][email-timeline] writeEmailTimelineCard failed", {
@@ -2871,8 +2885,9 @@ async function handleSentMailWebhook(cfg, payload) {
 
   if (timelineRes?.ok) {
     addDedupeKey(cfg, dedupKey);
+    const alreadyExisted = !!timelineRes.skipped && timelineRes.reason === "already_exists";
     return {
-      status: 201,
+      status: alreadyExisted ? 200 : 201,
       body: {
         ok: true,
         type: "sentMail",
@@ -2880,7 +2895,9 @@ async function handleSentMailWebhook(cfg, payload) {
         entityId,
         entityMatchRecipient,
         recipients: uniqueRecipients,
-        emailTimelineCardCreated: true,
+        emailTimelineCardCreated: !alreadyExisted,
+        emailTimelineAlreadyExisted: alreadyExisted,
+        emailTimelinePageId: timelineRes.pageId || "",
       },
     };
   }
@@ -3138,6 +3155,7 @@ async function handleTbActiveReceiverWebhook(cfg, payload, reqHeaders = {}) {
   const lastReplyCol = String(propNames.last_reply_time ?? "Last Reply Time").trim();
 
   let emailTimelineCardCreated = false;
+  let emailTimelineAlreadyExisted = false;
   let emailTimelineError = null;
   let lastReplyTimeUpdated = false;
 
@@ -3154,7 +3172,14 @@ async function handleTbActiveReceiverWebhook(cfg, payload, reqHeaders = {}) {
       body: replyText,
     });
     if (timelineRes?.ok) {
-      emailTimelineCardCreated = true;
+      // skipped+already_exists is still a success path for the caller: the
+      // target row is already in Notion, so we treat it like a write.
+      if (timelineRes?.skipped && timelineRes?.reason === "already_exists") {
+        emailTimelineAlreadyExisted = true;
+        emailTimelineCardCreated = true;
+      } else {
+        emailTimelineCardCreated = true;
+      }
     } else if (timelineRes?.skipped) {
       // no entity to write to — nothing to do
     } else {
@@ -3216,6 +3241,7 @@ async function handleTbActiveReceiverWebhook(cfg, payload, reqHeaders = {}) {
       interactionLogCreated,
       interactionLogError: interactionLogError || undefined,
       emailTimelineCardCreated,
+      emailTimelineAlreadyExisted: emailTimelineAlreadyExisted || undefined,
       emailTimelineError: emailTimelineError || undefined,
       lastReplyTimeUpdated,
       lastReplyTimeShanghai: shanghaiClock,
