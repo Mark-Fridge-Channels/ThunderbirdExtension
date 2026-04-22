@@ -2750,6 +2750,17 @@ async function handleTbActiveReceiverWebhook(cfg, payload, reqHeaders = {}) {
     }
   }
 
+  // 精确 (fc, author) 优先于同域名泛化：同公司多人（如 B 线 vs 转发后的 D@C.com）不应用「首次写入」的整域落错人。
+  if (!entityId) {
+    const cacheKey = buildInboundCacheKey(fc, author);
+    const exactMatch = cacheMap.byKey.get(cacheKey);
+    if (exactMatch) {
+      entityId = exactMatch.entityPageId || exactMatch.keyPersonId;
+      matchReason = "participant_match";
+      classification = "Human Reply Out Of Thread";
+    }
+  }
+
   if (!entityId) {
     const authorDomainMatch = author.match(/@(.+)$/);
     if (authorDomainMatch) {
@@ -2760,16 +2771,6 @@ async function handleTbActiveReceiverWebhook(cfg, payload, reqHeaders = {}) {
         matchReason = "same_domain_forward";
         classification = "Human Reply Forwarded";
       }
-    }
-  }
-
-  if (!entityId) {
-    const cacheKey = buildInboundCacheKey(fc, author);
-    const exactMatch = cacheMap.byKey.get(cacheKey);
-    if (exactMatch) {
-      entityId = exactMatch.entityPageId || exactMatch.keyPersonId;
-      matchReason = "participant_match";
-      classification = "Human Reply Out Of Thread";
     }
   }
 
