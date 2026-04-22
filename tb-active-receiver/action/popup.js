@@ -56,3 +56,42 @@ document.getElementById("debugLogInbox").addEventListener("click", async () => {
   }
   await refresh();
 });
+
+async function runSentMailScan({ entireSent }) {
+  const out = document.getElementById("out");
+  const res = await browser.runtime.sendMessage({
+    type: "tbActiveRx.scanSentMail",
+    entireSent: !!entireSent,
+  });
+  if (res?.ok) {
+    out.textContent = JSON.stringify(res.result, null, 2);
+  } else {
+    out.textContent = res?.error ?? "error";
+  }
+}
+
+document.getElementById("scanSentMail").addEventListener("click", async () => {
+  const btn = document.getElementById("scanSentMail");
+  btn.disabled = true;
+  const original = btn.textContent;
+  btn.textContent = "Scanning…";
+  try {
+    await runSentMailScan({ entireSent: false });
+  } finally {
+    btn.disabled = false;
+    btn.textContent = original;
+  }
+});
+
+document.getElementById("scanSentMailAll").addEventListener("click", async () => {
+  const btn = document.getElementById("scanSentMailAll");
+  btn.disabled = true;
+  const original = btn.textContent;
+  btn.textContent = "Scanning all…";
+  try {
+    await runSentMailScan({ entireSent: true });
+  } finally {
+    btn.disabled = false;
+    btn.textContent = original;
+  }
+});

@@ -96,5 +96,43 @@ async function appendBlockChildren(cfg, blockId, children) {
   return await notionFetch(cfg, "PATCH", `/blocks/${hyphenated}/children`, { children });
 }
 
-module.exports = { queryDatabase, getPage, updatePage, createPage, appendBlockChildren };
+/** GET /v1/blocks/{block_id}/children, paginated. */
+async function listBlockChildren(cfg, blockId, startCursor) {
+  const id = String(blockId || "").replace(/-/g, "");
+  if (!id) throw new Error("listBlockChildren: blockId required");
+  const hyphenated =
+    id.length === 32
+      ? `${id.slice(0, 8)}-${id.slice(8, 12)}-${id.slice(12, 16)}-${id.slice(16, 20)}-${id.slice(20)}`
+      : String(blockId);
+  const qs = new URLSearchParams({ page_size: "100" });
+  if (startCursor) qs.set("start_cursor", String(startCursor));
+  return await notionFetch(cfg, "GET", `/blocks/${hyphenated}/children?${qs.toString()}`);
+}
+
+/**
+ * POST /v1/databases — create a database.
+ * body = { parent, title?, is_inline?, properties }
+ */
+async function createDatabase(cfg, body) {
+  return await notionFetch(cfg, "POST", "/databases", body);
+}
+
+/** POST /v1/pages with `parent.database_id` — create a row in a database. */
+async function createPageInDatabase(cfg, databaseId, properties) {
+  return await notionFetch(cfg, "POST", "/pages", {
+    parent: { database_id: String(databaseId) },
+    properties,
+  });
+}
+
+module.exports = {
+  queryDatabase,
+  getPage,
+  updatePage,
+  createPage,
+  appendBlockChildren,
+  listBlockChildren,
+  createDatabase,
+  createPageInDatabase,
+};
 

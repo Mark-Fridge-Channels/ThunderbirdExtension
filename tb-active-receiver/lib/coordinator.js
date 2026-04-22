@@ -10,6 +10,7 @@ import * as activeFetcher from "./activeFetcher.js";
 import { attachNewMailListener } from "./replyDetector.js";
 import { runInboxReconcile } from "./inboxReconcile.js";
 import { drainReportQueue } from "./reportDelivery.js";
+import { scanSentMailAllAccounts, resetSentMailState } from "./sentMailScanner.js";
 
 const browser = globalThis.browser ?? globalThis.messenger;
 
@@ -286,6 +287,20 @@ export function registerAlarmAndMessageHandlers() {
     if (msg.type === "tbActiveRx.debugLogInbox") {
       debugLogInboxMessages()
         .then(() => sendResponse({ ok: true }))
+        .catch((e) => sendResponse({ ok: false, error: e?.message ?? String(e) }));
+      return true;
+    }
+
+    if (msg.type === "tbActiveRx.scanSentMail") {
+      const lookbackDays = Number(msg.lookbackDays) || undefined;
+      const entireSent = !!msg.entireSent;
+      (async () => {
+        if (entireSent) {
+          await resetSentMailState();
+        }
+        return scanSentMailAllAccounts({ lookbackDays, entireSent });
+      })()
+        .then((result) => sendResponse({ ok: true, result }))
         .catch((e) => sendResponse({ ok: false, error: e?.message ?? String(e) }));
       return true;
     }

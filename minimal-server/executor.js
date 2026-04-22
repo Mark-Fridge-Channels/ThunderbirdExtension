@@ -11,9 +11,10 @@
  * - "Already executed" is decided by the presence of `external_event_id` on the row.
  */
 
-const { queryDatabase, updatePage, createPage, getPage, appendBlockChildren } = require("./notion.js");
+const { queryDatabase, updatePage, createPage, getPage } = require("./notion.js");
 const { parseQueueRow, isWithinWindow, computeExternalEventId, readSelectName, readEmailValue } = require("./queueParser.js");
 const { mergeDedupeKeysInto, hasDedupeKey, addDedupeKey } = require("./inboundDedupe.js");
+const { createEmailTimelineCard } = require("./emailTimeline.js");
 const fs = require("fs");
 const path = require("path");
 
@@ -1697,6 +1698,40 @@ function buildInboundCreateProperties(sourceRow, inboundMsg, propNames, keyPerso
   return props;
 }
 
+/**
+ * Best-effort writer to the Entity page's inline "Email Timeline" database.
+ * Adds a new card describing one Send / Reply / Inbound email interaction.
+ * Errors are swallowed: timeline writeback never blocks the main writeback path.
+ *
+ * @param {object} cfg loadConfig()
+ * @param {string} entityPageId Notion page id of the Entity (falsy => noop)
+ * @param {object} card { kind, title, date, from, to, subject, body }
+ */
+async function writeEmailTimelineCard(cfg, entityPageId, card) {
+  const id = String(entityPageId || "").trim();
+  if (!id) return { skipped: true, reason: "no_entity_page_id" };
+  try {
+    const subject = String(card?.subject || "").trim();
+    const kindLabel = card?.kind ? `[${card.kind}] ` : "";
+    const title = String(card?.title || "").trim() || `${kindLabel}${subject || "(no subject)"}`;
+    const res = await createEmailTimelineCard(cfg, id, {
+      title,
+      date: card?.date instanceof Date ? card.date : (card?.date || new Date()),
+      from: String(card?.from || "").trim(),
+      to: String(card?.to || "").trim(),
+      subject,
+      body: String(card?.body || ""),
+    });
+    return { ok: true, ...res };
+  } catch (e) {
+    console.error("[executor][email-timeline] writeEmailTimelineCard failed", {
+      entityPageId: id,
+      error: e?.message ?? String(e),
+    });
+    return { ok: false, error: e?.message ?? String(e) };
+  }
+}
+
 async function markReplyDone(cfg, row, detailText) {
   const notionCfg = { token: cfg.notion.token, notionVersion: cfg.notion.notionVersion };
   const names = cfg.executor?.notionPropertyNames || {};
@@ -1861,6 +1896,21 @@ async function runInboundWatchOnce({ cfg, enqueueAndWait }) {
       if (matchedOut) {
         await markReplyDone(cfg, matchedOut, `inbound_reply_detected:${target.headerMessageId || target.messageId}`);
       }
+      const entityForTimeline = String(matchedCache.entityPageId || "").trim();
+      if (entityForTimeline) {
+        const inboundSubject = target.subject || matchedOut?.subject || "";
+        const inboundBody = target.body || "";
+        const inboundDate = target.date instanceof Date ? target.date : (target.date ? new Date(target.date) : new Date());
+        await writeEmailTimelineCard(cfg, entityForTimeline, {
+          kind: "Inbound Reply",
+          title: `[Inbound Reply] ${inboundSubject || "(no subject)"}`,
+          date: inboundDate,
+          from: authorEmail,
+          to: matchedFc,
+          subject: inboundSubject,
+          body: stripHtmlToPlain(inboundBody),
+        });
+      }
       existingInboundDedupKeys.add(dedupKey);
       addDedupeKey(cfg, dedupKey);
       console.error("[executor][inbound] captured inbound", {
@@ -1869,6 +1919,7 @@ async function runInboundWatchOnce({ cfg, enqueueAndWait }) {
         inboundMessageId: target.messageId,
         fcAccount: matchedFc,
         keyPersonId: matchedCache.keyPersonId,
+        entityPageId: entityForTimeline || null,
       });
     }
 
@@ -2161,6 +2212,35 @@ async function successWriteback({ cfg, row, detail, externalEventId, payloadText
       error: e?.message ?? e,
     });
   }
+
+  // Email Timeline card on Entity page (Send Email / Reply Email only).
+  try {
+    const entityPageId = String(row?.entityPageId || "").trim();
+    if (entityPageId && (row?.actionText === "Send Email" || row?.actionText === "Reply Email")) {
+      const kind = row.actionText === "Reply Email" ? "Reply" : "Send";
+      const to = normalizeEmail(partnerEmailResolved || row?.counterpartyEmail || "");
+      const from = normalizeEmail(row?.fcAccount || "");
+      const subject = String(row?.subject || "").trim();
+      const titlePrefix = kind === "Reply" && !/^re:/i.test(subject) ? "Re: " : "";
+      const title = `[${kind}] ${titlePrefix}${subject || "(no subject)"}`;
+      await writeEmailTimelineCard(cfg, entityPageId, {
+        kind,
+        title,
+        date: new Date(),
+        from,
+        to,
+        subject: kind === "Reply" && !/^re:/i.test(subject) ? `Re: ${subject}` : subject,
+        body: stripHtmlToPlain(row?.body || ""),
+      });
+    }
+  } catch (e) {
+    console.error("[executor] email timeline card write (outbound) failed", {
+      taskId: row?.taskId,
+      pageId: row?.pageId,
+      error: e?.message ?? String(e),
+    });
+  }
+
   return { kind: "written", ok: true };
 }
 
@@ -2662,6 +2742,152 @@ async function queryFirstTemplateQueueRow(notionCfg, databaseId, outreachStatusC
 }
 
 /**
+ * Resolve the best Entity page id for an outgoing Send/Reply email (fc, recipient).
+ * Tries, in order:
+ *   1. Inbound contact cache (fc|recipient)
+ *   2. Same-company domain mapping (non-consumer domain)
+ * Returns "" when no mapping is known.
+ */
+function resolveEntityForSentMail(cfg, fc, recipient) {
+  const f = normalizeEmail(fc);
+  const r = normalizeEmail(recipient);
+  if (!f || !r) return "";
+  const cacheMap = readContactCacheMapFresh(cfg);
+  const exact = cacheMap.byKey.get(buildInboundCacheKey(f, r));
+  if (exact?.entityPageId) return String(exact.entityPageId).trim();
+  if (exact?.keyPersonId) return String(exact.keyPersonId).trim();
+  const domain = extractDomainFromEmail(r);
+  if (domain && !isConsumerEmailDomain(domain)) {
+    const dom = cacheMap.domainMap.get(domain);
+    if (dom?.entityId) return String(dom.entityId).trim();
+  }
+  return "";
+}
+
+/**
+ * Handle a `tb-active-receiver.sentMail` webhook from the extension.
+ *
+ * Payload shape:
+ *   { schemaVersion: 1, type: "tb-active-receiver.sentMail",
+ *     fcAccount, accountId, messageId, headerMessageId,
+ *     to, cc, bcc, subject, bodyPlain, bodyHtml, sentAt }
+ *
+ * We dedupe by (fc, headerMessageId/messageId), match the recipient to an
+ * Entity via the inbound contact cache, then add a card to the Entity page's
+ * inline "Email Timeline" database.
+ */
+async function handleSentMailWebhook(cfg, payload) {
+  const fc = normalizeEmail(payload?.fcAccount);
+  if (!fc) {
+    return { status: 400, body: { ok: false, error: "missing_fc_account" } };
+  }
+  const recipients = [];
+  const pushMany = (v) => {
+    if (!v) return;
+    if (Array.isArray(v)) for (const x of v) pushMany(x);
+    else if (typeof v === "string") {
+      for (const tok of v.split(/[,;]/).map((s) => s.trim()).filter(Boolean)) {
+        const em = extractEmail(tok);
+        if (em) recipients.push(em);
+      }
+    }
+  };
+  pushMany(payload?.to);
+  pushMany(payload?.cc);
+  pushMany(payload?.bcc);
+  const uniqueRecipients = Array.from(new Set(recipients.map((x) => normalizeEmail(x)).filter(Boolean)));
+  if (uniqueRecipients.length === 0) {
+    return { status: 400, body: { ok: false, error: "missing_recipient" } };
+  }
+  const primaryRecipient = uniqueRecipients[0];
+
+  const dedupKey = `sent:${buildInboundDedupKey(fc, {
+    headerMessageId: payload?.headerMessageId,
+    messageId: payload?.messageId,
+  })}`;
+  if (!dedupKey || dedupKey === "sent:") {
+    return { status: 400, body: { ok: false, error: "missing_header_message_id_and_message_id" } };
+  }
+  if (hasDedupeKey(cfg, dedupKey)) {
+    return { status: 200, body: { ok: true, skipped: true, reason: "dedupe" } };
+  }
+
+  // Try to find an Entity page id for the primary recipient; fall back to
+  // scanning all recipients if the first one is unknown.
+  let entityId = resolveEntityForSentMail(cfg, fc, primaryRecipient);
+  let entityMatchRecipient = primaryRecipient;
+  if (!entityId) {
+    for (const rcpt of uniqueRecipients.slice(1)) {
+      const id = resolveEntityForSentMail(cfg, fc, rcpt);
+      if (id) {
+        entityId = id;
+        entityMatchRecipient = rcpt;
+        break;
+      }
+    }
+  }
+
+  if (!entityId) {
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        skipped: true,
+        reason: "no_entity_match",
+        fcAccount: fc,
+        recipients: uniqueRecipients,
+      },
+    };
+  }
+
+  const bodyPlain = typeof payload?.bodyPlain === "string" ? payload.bodyPlain : "";
+  const bodyHtml = typeof payload?.bodyHtml === "string" ? payload.bodyHtml : "";
+  const cardBody = bodyPlain.trim() ? bodyPlain : stripHtmlToPlain(bodyHtml);
+
+  const sentAt = payload?.sentAt ? new Date(payload.sentAt) : new Date();
+  const subject = String(payload?.subject || "").trim();
+  const isReply = /^re:\s/i.test(subject);
+  const kind = isReply ? "Reply" : "Send";
+  const title = `[${kind}] ${subject || "(no subject)"}`;
+
+  const timelineRes = await writeEmailTimelineCard(cfg, entityId, {
+    kind,
+    title,
+    date: sentAt,
+    from: fc,
+    to: uniqueRecipients.join(", "),
+    subject,
+    body: cardBody,
+  });
+
+  if (timelineRes?.ok) {
+    addDedupeKey(cfg, dedupKey);
+    return {
+      status: 201,
+      body: {
+        ok: true,
+        type: "sentMail",
+        kind,
+        entityId,
+        entityMatchRecipient,
+        recipients: uniqueRecipients,
+        emailTimelineCardCreated: true,
+      },
+    };
+  }
+  return {
+    status: 502,
+    body: {
+      ok: false,
+      type: "sentMail",
+      error: "email_timeline_write_failed",
+      detail: timelineRes?.error || null,
+      entityId,
+    },
+  };
+}
+
+/**
  * TB Active Receiver: POST JSON webhook → optional contact-cache filter → Notion In row.
  * Headers: optional `X-TB-Receiver-Secret` when `executor.tb_receiver_webhook_secret` is set.
  *
@@ -2684,8 +2910,34 @@ async function handleTbActiveReceiverWebhook(cfg, payload, reqHeaders = {}) {
   if (!payload || typeof payload !== "object") {
     return { status: 400, body: { ok: false, error: "invalid_payload" } };
   }
-  if (Number(payload.schemaVersion) !== 1 || payload.type !== "tb-active-receiver.newMail") {
-    return { status: 400, body: { ok: false, error: "schema_mismatch", expected: { schemaVersion: 1, type: "tb-active-receiver.newMail" } } };
+  if (Number(payload.schemaVersion) !== 1) {
+    return {
+      status: 400,
+      body: {
+        ok: false,
+        error: "schema_mismatch",
+        expected: {
+          schemaVersion: 1,
+          type: "tb-active-receiver.newMail | tb-active-receiver.sentMail",
+        },
+      },
+    };
+  }
+  if (payload.type === "tb-active-receiver.sentMail") {
+    return await handleSentMailWebhook(cfg, payload);
+  }
+  if (payload.type !== "tb-active-receiver.newMail") {
+    return {
+      status: 400,
+      body: {
+        ok: false,
+        error: "schema_mismatch",
+        expected: {
+          schemaVersion: 1,
+          type: "tb-active-receiver.newMail | tb-active-receiver.sentMail",
+        },
+      },
+    };
   }
 
   const fc = normalizeEmail(payload.fcAccount);
@@ -2871,98 +3123,61 @@ async function handleTbActiveReceiverWebhook(cfg, payload, reqHeaders = {}) {
     console.error("[executor][webhook] skip InteractionLOG: no success Outbound template row in Notion");
   }
 
-  const safeReplyText = replyText.slice(0, 1500) + (replyText.length > 1500 ? "..." : "");
   const timestamp = payload.receivedAt ? new Date(payload.receivedAt) : new Date();
   const shanghaiClock = formatShanghaiWallClockForHeading(timestamp);
 
-  const blocks = [
-    { object: "block", type: "divider", divider: {} },
-    {
-      object: "block",
-      type: "heading_3",
-      heading_3: {
-        rich_text: [
-          {
-            type: "text",
-            text: { content: `[${classification}] ${shanghaiClock} (+08 Asia/Shanghai)` },
-          },
-        ],
-      },
-    },
-    {
-      object: "block",
-      type: "paragraph",
-      paragraph: {
-        rich_text: [
-          { type: "text", text: { content: "From: " }, annotations: { bold: true } },
-          { type: "text", text: { content: `${payload.author}\n` } },
-          { type: "text", text: { content: "To: " }, annotations: { bold: true } },
-          { type: "text", text: { content: `${fc}\n` } },
-          { type: "text", text: { content: "Subject: " }, annotations: { bold: true } },
-          { type: "text", text: { content: `${payload.subject}\n` } },
-          { type: "text", text: { content: "Match Reason: " }, annotations: { bold: true, color: "gray" } },
-          { type: "text", text: { content: `${matchReason}` }, annotations: { color: "gray" } },
-        ],
-      },
-    },
-    {
-      object: "block",
-      type: "quote",
-      quote: {
-        rich_text: [{ type: "text", text: { content: safeReplyText || "(No Content)" } }],
-      },
-    },
-  ];
-
   const lastReplyCol = String(propNames.last_reply_time ?? "Last Reply Time").trim();
 
-  let entityAppendOk = false;
+  let emailTimelineCardCreated = false;
+  let emailTimelineError = null;
   let lastReplyTimeUpdated = false;
 
   if (entityId) {
-    try {
-      await appendBlockChildren(notionCfg, entityId, blocks);
-      entityAppendOk = true;
-      if (lastReplyCol) {
-        try {
-          await updatePage(notionCfg, entityId, {
-            [lastReplyCol]: notionDateTimeAsiaShanghai(timestamp),
-          });
-          lastReplyTimeUpdated = true;
-        } catch (e2) {
-          console.error("[executor][webhook] Last Reply Time property update failed", {
-            entityId,
-            column: lastReplyCol,
-            detail: e2?.message ?? String(e2),
-          });
-        }
+    const subjectText = String(payload.subject || "").trim();
+    const cardTitle = `[${classification}] ${subjectText || "(no subject)"}`;
+    const timelineRes = await writeEmailTimelineCard(cfg, entityId, {
+      kind: classification,
+      title: cardTitle,
+      date: timestamp,
+      from: String(payload.author || author || "").trim(),
+      to: fc,
+      subject: subjectText,
+      body: replyText,
+    });
+    if (timelineRes?.ok) {
+      emailTimelineCardCreated = true;
+    } else if (timelineRes?.skipped) {
+      // no entity to write to — nothing to do
+    } else {
+      emailTimelineError = timelineRes?.error || "email_timeline_write_failed";
+    }
+    if (lastReplyCol) {
+      try {
+        await updatePage(notionCfg, entityId, {
+          [lastReplyCol]: notionDateTimeAsiaShanghai(timestamp),
+        });
+        lastReplyTimeUpdated = true;
+      } catch (e2) {
+        console.error("[executor][webhook] Last Reply Time property update failed", {
+          entityId,
+          column: lastReplyCol,
+          detail: e2?.message ?? String(e2),
+        });
       }
-    } catch (e) {
-      console.error("[executor][webhook] appendBlockChildren failed", e?.message ?? e);
-      return {
-        status: 502,
-        body: {
-          ok: false,
-          error: "notion_append_failed",
-          detail: e?.message ?? String(e),
-          interactionLogCreated,
-          interactionLogError,
-        },
-      };
     }
   }
 
-  if (interactionLogCreated || entityAppendOk) {
+  if (interactionLogCreated || emailTimelineCardCreated) {
     addDedupeKey(cfg, dedupKey);
   }
 
-  if (!interactionLogCreated && !entityAppendOk) {
+  if (!interactionLogCreated && !emailTimelineCardCreated) {
     return {
       status: 502,
       body: {
         ok: false,
         error: "notion_no_row_written",
-        detail: interactionLogError || "no_entity_match_and_interaction_log_not_created",
+        detail: interactionLogError || emailTimelineError || "no_entity_match_and_interaction_log_not_created",
         is_reply_reason: replyProbe.reason,
       },
     };
@@ -2975,7 +3190,7 @@ async function handleTbActiveReceiverWebhook(cfg, payload, reqHeaders = {}) {
     matchReason,
     is_reply_reason: replyProbe.reason,
     interactionLogCreated,
-    entityAppendOk,
+    emailTimelineCardCreated,
     lastReplyTimeUpdated,
   });
 
@@ -2991,7 +3206,8 @@ async function handleTbActiveReceiverWebhook(cfg, payload, reqHeaders = {}) {
       outboundPageId: outboundPageId || "",
       interactionLogCreated,
       interactionLogError: interactionLogError || undefined,
-      entityAppendOk,
+      emailTimelineCardCreated,
+      emailTimelineError: emailTimelineError || undefined,
       lastReplyTimeUpdated,
       lastReplyTimeShanghai: shanghaiClock,
     },
