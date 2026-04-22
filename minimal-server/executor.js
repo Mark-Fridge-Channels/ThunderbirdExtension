@@ -28,6 +28,10 @@ let inboundContactCacheState = null;
 /** Outbound attribution cache for unknown-sender inbound matching. */
 let outboundAttributionCacheState = null;
 
+/** TTL cache: Success Out rows for webhook `is_reply` branch B + InteractionLOG row template. */
+let cachedSuccessOutRowsForWebhook = { at: 0, rows: [] };
+const SUCCESS_OUT_ROWS_TTL_MS = 60_000;
+
 const OUTBOUND_ATTRIBUTION_WINDOW_DAYS = 30;
 const OUTBOUND_ATTRIBUTION_MAX_ROWS = 5000;
 const OUTBOUND_ATTRIBUTION_MIN_BODY_LEN = 80;
@@ -58,6 +62,51 @@ function notionDate(date) {
   return { date: { start: date.toISOString() } };
 }
 
+const ASIA_SHANGHAI = "Asia/Shanghai";
+
+/** Notion date property: datetime in Asia/Shanghai with explicit +08:00 (for Last Reply Time). */
+function notionDateTimeAsiaShanghai(date) {
+  const d = date instanceof Date ? date : new Date(date);
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: ASIA_SHANGHAI,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).formatToParts(d);
+  const g = (type) => parts.find((x) => x.type === type)?.value ?? "00";
+  const pad2 = (s) => String(s).padStart(2, "0");
+  const y = g("year");
+  const mo = pad2(g("month"));
+  const da = pad2(g("day"));
+  const h = pad2(g("hour"));
+  const mi = pad2(g("minute"));
+  const se = pad2(g("second"));
+  const start = `${y}-${mo}-${da}T${h}:${mi}:${se}.000+08:00`;
+  return { date: { start, time_zone: ASIA_SHANGHAI } };
+}
+
+/** Human-readable Shanghai local time for Notion page block headings. */
+function formatShanghaiWallClockForHeading(date) {
+  const d = date instanceof Date ? date : new Date(date);
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: ASIA_SHANGHAI,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).formatToParts(d);
+  const g = (type) => parts.find((x) => x.type === type)?.value ?? "00";
+  const pad2 = (s) => String(s).padStart(2, "0");
+  return `${g("year")}-${pad2(g("month"))}-${pad2(g("day"))} ${pad2(g("hour"))}:${pad2(g("minute"))}:${pad2(g("second"))}`;
+}
+
 function notionSelect(name) {
   return { select: { name } };
 }
@@ -82,6 +131,10 @@ function notionFromValueByType(type, value) {
   if (type === "select") return notionSelect(String(value || ""));
   if (type === "date") return notionDate(value instanceof Date ? value : new Date(value));
   if (type === "title") return notionTitle(String(value || ""));
+  if (type === "email") {
+    const em = extractEmail(String(value || ""));
+    return em ? { email: em } : { email: null };
+  }
   return notionRichText(String(value || ""));
 }
 
@@ -361,6 +414,89 @@ function buildInboundCacheKey(fcAccount, counterpartyEmail) {
 /** Strip RFC 2822 angle-bracket wrapping from a Message-ID so stored keys and lookup keys always match. */
 function normalizeMessageId(id) {
   return String(id || "").trim().replace(/^<+|>+$/g, "").trim();
+}
+
+const CONSUMER_EMAIL_DOMAINS = new Set([
+  "gmail.com",
+  "yahoo.com",
+  "hotmail.com",
+  "outlook.com",
+  "qq.com",
+  "163.com",
+  "icloud.com",
+]);
+
+function extractDomainFromEmail(email) {
+  const e = normalizeEmail(email);
+  const i = e.indexOf("@");
+  return i > 0 ? e.slice(i + 1) : "";
+}
+
+function isConsumerEmailDomain(domain) {
+  return CONSUMER_EMAIL_DOMAINS.has(String(domain || "").toLowerCase());
+}
+
+/** Minimal Message-ID sanity check for In-Reply-To / References tokens. */
+function isParseableMessageIdToken(token) {
+  const t = normalizeMessageId(token);
+  if (!t || t.length < 4 || t.length > 250) return false;
+  if (!t.includes("@")) return false;
+  return true;
+}
+
+/** True if the header string contains at least one whitespace-delimited Message-ID token. */
+function headerFieldHasParseableMessageId(headerField) {
+  const s = String(headerField || "").trim();
+  if (!s) return false;
+  for (const raw of s.split(/\s+/)) {
+    if (isParseableMessageIdToken(raw)) return true;
+  }
+  return false;
+}
+
+/** Same fc + (exact author email OR same non-consumer domain as outbound counterparty). */
+function outboundRowMatchesAuthorDomain(row, authorEmail) {
+  const cp = normalizeEmail(row?.counterpartyEmail);
+  const au = normalizeEmail(authorEmail);
+  if (!cp || !au) return false;
+  if (cp === au) return true;
+  const d1 = extractDomainFromEmail(au);
+  const d2 = extractDomainFromEmail(cp);
+  if (!d1 || !d2 || d1 !== d2) return false;
+  if (isConsumerEmailDomain(d1)) return false;
+  return true;
+}
+
+function filterSuccessOutRowsForFcAndAuthor(rows, fc, authorEmail) {
+  const f = normalizeEmail(fc);
+  if (!f) return [];
+  return (rows || []).filter((r) => normalizeEmail(r?.fcAccount) === f && outboundRowMatchesAuthorDomain(r, authorEmail));
+}
+
+/**
+ * Subject-line best match among rows already filtered to fc + author/domain.
+ * Mirrors findBestMatchingOutRow without re-checking counterparty.
+ */
+function findBestMatchingOutRowFromCandidates(rows, subjectText) {
+  const normalizedInboundSubject = normalizeSubjectForMatch(subjectText);
+  let fallback = null;
+  for (const row of rows || []) {
+    if (!fallback) fallback = row;
+    const outNormalized = normalizeSubjectForMatch(row?.subject || "");
+    if (outNormalized && normalizedInboundSubject && outNormalized === normalizedInboundSubject) return row;
+    if (outNormalized && normalizedInboundSubject && String(subjectText || "").toLowerCase().includes(outNormalized)) {
+      return row;
+    }
+  }
+  return fallback;
+}
+
+function hasHistoricalContactForReply(cacheMap, fc, author) {
+  const key = buildInboundCacheKey(fc, author);
+  if (cacheMap.byKey.has(key)) return true;
+  const dom = extractDomainFromEmail(author);
+  if (dom && !isConsumerEmailDomain(dom) && cacheMap.domainMap.has(dom)) return true;
+  return false;
 }
 
 function canonicalTextForContains(input) {
@@ -1137,6 +1273,73 @@ async function queryAllSuccessOutPages(notionCfg, databaseId, pageSize, outreach
   return out;
 }
 
+async function getCachedSuccessOutRows(cfg) {
+  const now = Date.now();
+  if (
+    cachedSuccessOutRowsForWebhook.rows?.length &&
+    now - cachedSuccessOutRowsForWebhook.at < SUCCESS_OUT_ROWS_TTL_MS
+  ) {
+    return cachedSuccessOutRowsForWebhook.rows;
+  }
+  const notionCfg = { token: cfg.notion.token, notionVersion: cfg.notion.notionVersion };
+  const databaseId = cfg.notion.databaseId;
+  const outreachStatusCol = cfg.executor?.notionPropertyNames?.Status || "OutReach Status";
+  const pages = await queryAllSuccessOutPages(
+    notionCfg,
+    databaseId,
+    Math.max(100, cfg.executor.pageSize || 20),
+    outreachStatusCol
+  );
+  const rows = pages
+    .map((p) => parseQueueRow(p))
+    .filter(
+      (r) =>
+        r.platform === "Email" &&
+        r.inNOut === "Out" &&
+        r.status === "Success" &&
+        (r.actionText === "Send Email" || r.actionText === "Reply Email")
+    );
+  cachedSuccessOutRowsForWebhook = { at: now, rows };
+  return rows;
+}
+
+/**
+ * minimal-server `is_reply`:
+ * - In-Reply-To or References contains ≥1 parseable Message-ID, OR
+ * - (historical contact: exact or non-consumer domain) AND subject overlap AND inbound body overlaps outbound body.
+ */
+async function computeIsReplyForWebhook(cfg, payload, cacheMap, fc, author, replyText) {
+  const irt = String(payload.inReplyTo || "").trim();
+  const refs = String(payload.references || "").trim();
+  if (headerFieldHasParseableMessageId(irt) || headerFieldHasParseableMessageId(refs)) {
+    return { isReply: true, reason: "threading_headers", matchedOut: null };
+  }
+  if (!hasHistoricalContactForReply(cacheMap, fc, author)) {
+    return { isReply: false, reason: "no_historical_contact", matchedOut: null };
+  }
+  const successOutRows = await getCachedSuccessOutRows(cfg);
+  const candidates = filterSuccessOutRowsForFcAndAuthor(successOutRows, fc, author);
+  if (candidates.length === 0) {
+    return { isReply: false, reason: "no_outbound_candidate", matchedOut: null };
+  }
+  const matchedOut = findBestMatchingOutRowFromCandidates(candidates, payload.subject || "");
+  if (!matchedOut) {
+    return { isReply: false, reason: "no_subject_match", matchedOut: null };
+  }
+  const inboundSubjectNorm = normalizeSubjectForMatch(payload.subject || "");
+  const outSubjectNorm = normalizeSubjectForMatch(matchedOut.subject || "");
+  if (!subjectContainsMatch(inboundSubjectNorm, outSubjectNorm)) {
+    return { isReply: false, reason: "subject_mismatch", matchedOut: null };
+  }
+  const inboundBodyNorm = canonicalTextForContains(replyText);
+  const outBody = normalizeBodyForAttribution(matchedOut.body || matchedOut.payload?.body || "");
+  const outBodyNorm = canonicalTextForContains(outBody);
+  if (!bodyContainsMatch(inboundBodyNorm, outBodyNorm)) {
+    return { isReply: false, reason: "body_no_overlap", matchedOut: null };
+  }
+  return { isReply: true, reason: "subject_contact_body", matchedOut };
+}
+
 function buildOutboundCacheCandidates(rows, allowedSenders) {
   const result = [];
   for (const row of rows || []) {
@@ -1437,6 +1640,15 @@ function buildInboundCreateProperties(sourceRow, inboundMsg, propNames, keyPerso
   if (kpTarget) {
     const kt = getPropertyType(srcPage, "KeyPerson ID");
     if (kt === "relation") props["KeyPerson ID"] = { relation: [{ id: kpTarget }] };
+  }
+
+  const replyEmailCol = String(p.reply_email || "Reply Email").trim();
+  if (!kpTarget && replyEmailCol) {
+    const em = extractEmail(inboundMsg?.authorEmail || inboundMsg?.author || "");
+    if (em) {
+      const rt = getPropertyType(srcPage, replyEmailCol);
+      if (rt === "email") props[replyEmailCol] = notionFromValueByType("email", em);
+    }
   }
 
   // Extra fields required by InteractionLOG inbound spec.
@@ -2443,6 +2655,19 @@ async function handleTbActiveReceiverWebhook(cfg, payload, reqHeaders = {}) {
   }
 
   const cacheMap = readContactCacheMapFresh(cfg);
+
+  const bodyPlain = typeof payload.bodyPlain === "string" ? payload.bodyPlain : "";
+  const bodyHtml = typeof payload.bodyHtml === "string" ? payload.bodyHtml : "";
+  const replyText = bodyPlain.trim() ? bodyPlain : stripHtmlToPlain(bodyHtml);
+
+  const replyProbe = await computeIsReplyForWebhook(cfg, payload, cacheMap, fc, author, replyText);
+  if (!replyProbe.isReply) {
+    return {
+      status: 200,
+      body: { ok: true, skipped: true, reason: "not_reply", is_reply: false, detail: replyProbe.reason },
+    };
+  }
+
   const dedupKey = buildInboundDedupKey(fc, {
     headerMessageId: payload.headerMessageId,
     messageId: payload.messageId,
@@ -2461,9 +2686,7 @@ async function handleTbActiveReceiverWebhook(cfg, payload, reqHeaders = {}) {
 
   const inReplyTo = String(payload.inReplyTo || "").trim();
   const references = String(payload.references || "").trim();
-  const threadId = String(payload.threadId || "").trim();
-  
-  // Normalize every candidate ID before lookup so angle-bracket variants in email headers always match
+
   const headersToMatch = [];
   if (inReplyTo) {
     const n = normalizeMessageId(inReplyTo);
@@ -2504,7 +2727,6 @@ async function handleTbActiveReceiverWebhook(cfg, payload, reqHeaders = {}) {
     const cacheKey = buildInboundCacheKey(fc, author);
     const exactMatch = cacheMap.byKey.get(cacheKey);
     if (exactMatch) {
-      // Prefer entityPageId (Entity Name relation); fall back to keyPersonId for older cache entries
       entityId = exactMatch.entityPageId || exactMatch.keyPersonId;
       matchReason = "participant_match";
       classification = "Human Reply Out Of Thread";
@@ -2525,31 +2747,96 @@ async function handleTbActiveReceiverWebhook(cfg, payload, reqHeaders = {}) {
     }
   }
 
-  if (!entityId) {
-    return { status: 200, body: { ok: true, skipped: true, reason: "not_matched_after_three_signals" } };
+  const notionCfg = { token: cfg.notion.token, notionVersion: cfg.notion.notionVersion };
+  const databaseId = cfg.notion.databaseId;
+  const propNames = cfg.executor?.notionPropertyNames || {};
+
+  const successOutRows = await getCachedSuccessOutRows(cfg);
+  const rowCandidates = filterSuccessOutRowsForFcAndAuthor(successOutRows, fc, author);
+  const matchedOutForLog =
+    replyProbe.matchedOut || findBestMatchingOutRowFromCandidates(rowCandidates, payload.subject || "");
+  const templateRow = successOutRows.find((r) => r?.raw) || matchedOutForLog || null;
+
+  let keyPersonId = "";
+  const ck = buildInboundCacheKey(fc, author);
+  if (cacheMap.byKey.has(ck)) {
+    keyPersonId = String(cacheMap.byKey.get(ck).keyPersonId || "").trim();
+  }
+  if (!keyPersonId && matchedOutForLog?.keyPersonPageId) {
+    keyPersonId = String(matchedOutForLog.keyPersonPageId || "").trim();
   }
 
-  const notionCfg = { token: cfg.notion.token, notionVersion: cfg.notion.notionVersion };
-  
-  const bodyPlain = typeof payload.bodyPlain === "string" ? payload.bodyPlain : "";
-  const bodyHtml = typeof payload.bodyHtml === "string" ? payload.bodyHtml : "";
-  const replyText = bodyPlain.trim() ? bodyPlain : stripHtmlToPlain(bodyHtml);
-  const safeReplyText = replyText.slice(0, 1500) + (replyText.length > 1500 ? "..." : "");
+  const interactionPayload = {
+    ...payload,
+    is_reply: true,
+    is_reply_reason: replyProbe.reason,
+    entity_match: {
+      entityId: entityId || null,
+      matchReason,
+      classification,
+      outboundPageId: outboundPageId || null,
+    },
+    source: "tb-active-receiver.webhook",
+  };
 
+  const inboundMsg = {
+    messageId: payload.messageId,
+    headerMessageId: payload.headerMessageId,
+    subject: payload.subject || "",
+    body: replyText,
+    replyText,
+    date: payload.receivedAt ? new Date(payload.receivedAt) : new Date(),
+    snippet: (replyText || "").slice(0, 240),
+    author: payload.author,
+    authorEmail: author,
+    from_email: author,
+    payload: interactionPayload,
+  };
+
+  let interactionLogCreated = false;
+  let interactionLogError = null;
+  if (templateRow) {
+    try {
+      const createProps = buildInboundCreateProperties(
+        matchedOutForLog || templateRow,
+        inboundMsg,
+        propNames,
+        keyPersonId
+      );
+      await createPage(notionCfg, databaseId, createProps);
+      interactionLogCreated = true;
+      if (matchedOutForLog?.pageId) {
+        await markReplyDone(
+          cfg,
+          matchedOutForLog,
+          `tb_webhook_inbound:${payload.headerMessageId || payload.messageId}`
+        );
+      }
+    } catch (eLog) {
+      interactionLogError = eLog?.message ?? String(eLog);
+      console.error("[executor][webhook] InteractionLOG createPage failed", interactionLogError);
+    }
+  } else {
+    console.error("[executor][webhook] skip InteractionLOG: no success Outbound template row in Notion");
+  }
+
+  const safeReplyText = replyText.slice(0, 1500) + (replyText.length > 1500 ? "..." : "");
   const timestamp = payload.receivedAt ? new Date(payload.receivedAt) : new Date();
+  const shanghaiClock = formatShanghaiWallClockForHeading(timestamp);
 
   const blocks = [
-    {
-      object: "block",
-      type: "divider",
-      divider: {}
-    },
+    { object: "block", type: "divider", divider: {} },
     {
       object: "block",
       type: "heading_3",
       heading_3: {
-        rich_text: [{ type: "text", text: { content: `[${classification}] ${timestamp.toISOString().slice(0,19).replace('T', ' ')}` } }]
-      }
+        rich_text: [
+          {
+            type: "text",
+            text: { content: `[${classification}] ${shanghaiClock} (+08 Asia/Shanghai)` },
+          },
+        ],
+      },
     },
     {
       object: "block",
@@ -2563,42 +2850,101 @@ async function handleTbActiveReceiverWebhook(cfg, payload, reqHeaders = {}) {
           { type: "text", text: { content: "Subject: " }, annotations: { bold: true } },
           { type: "text", text: { content: `${payload.subject}\n` } },
           { type: "text", text: { content: "Match Reason: " }, annotations: { bold: true, color: "gray" } },
-          { type: "text", text: { content: `${matchReason}` }, annotations: { color: "gray" } }
-        ]
-      }
+          { type: "text", text: { content: `${matchReason}` }, annotations: { color: "gray" } },
+        ],
+      },
     },
     {
       object: "block",
       type: "quote",
       quote: {
-        rich_text: [{ type: "text", text: { content: safeReplyText || "(No Content)" } }]
-      }
-    }
+        rich_text: [{ type: "text", text: { content: safeReplyText || "(No Content)" } }],
+      },
+    },
   ];
 
-  try {
-    await appendBlockChildren(notionCfg, entityId, blocks);
+  const lastReplyCol = String(propNames.last_reply_time ?? "Last Reply Time").trim();
+
+  let entityAppendOk = false;
+  let lastReplyTimeUpdated = false;
+
+  if (entityId) {
+    try {
+      await appendBlockChildren(notionCfg, entityId, blocks);
+      entityAppendOk = true;
+      if (lastReplyCol) {
+        try {
+          await updatePage(notionCfg, entityId, {
+            [lastReplyCol]: notionDateTimeAsiaShanghai(timestamp),
+          });
+          lastReplyTimeUpdated = true;
+        } catch (e2) {
+          console.error("[executor][webhook] Last Reply Time property update failed", {
+            entityId,
+            column: lastReplyCol,
+            detail: e2?.message ?? String(e2),
+          });
+        }
+      }
+    } catch (e) {
+      console.error("[executor][webhook] appendBlockChildren failed", e?.message ?? e);
+      return {
+        status: 502,
+        body: {
+          ok: false,
+          error: "notion_append_failed",
+          detail: e?.message ?? String(e),
+          interactionLogCreated,
+          interactionLogError,
+        },
+      };
+    }
+  }
+
+  if (interactionLogCreated || entityAppendOk) {
     addDedupeKey(cfg, dedupKey);
-    console.error("[executor][webhook] appended reply to entity page", {
-      entityId,
-      dedupKey,
-      classification,
-      matchReason
-    });
+  }
+
+  if (!interactionLogCreated && !entityAppendOk) {
     return {
-      status: 201,
+      status: 502,
       body: {
-        ok: true,
-        entityId,
-        matchReason,
-        classification,
-        outboundPageId: outboundPageId || "",
+        ok: false,
+        error: "notion_no_row_written",
+        detail: interactionLogError || "no_entity_match_and_interaction_log_not_created",
+        is_reply_reason: replyProbe.reason,
       },
     };
-  } catch (e) {
-    console.error("[executor][webhook] appendBlockChildren failed", e?.message ?? e);
-    return { status: 502, body: { ok: false, error: "notion_append_failed", detail: e?.message ?? String(e) } };
   }
+
+  console.error("[executor][webhook] processed", {
+    entityId: entityId || null,
+    dedupKey,
+    classification,
+    matchReason,
+    is_reply_reason: replyProbe.reason,
+    interactionLogCreated,
+    entityAppendOk,
+    lastReplyTimeUpdated,
+  });
+
+  return {
+    status: 201,
+    body: {
+      ok: true,
+      is_reply: true,
+      is_reply_reason: replyProbe.reason,
+      entityId: entityId || "",
+      matchReason,
+      classification,
+      outboundPageId: outboundPageId || "",
+      interactionLogCreated,
+      interactionLogError: interactionLogError || undefined,
+      entityAppendOk,
+      lastReplyTimeUpdated,
+      lastReplyTimeShanghai: shanghaiClock,
+    },
+  };
 }
 
 async function startExecutor({ cfg, enqueueAndWait }) {

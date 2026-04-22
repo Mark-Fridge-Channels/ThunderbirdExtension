@@ -36,7 +36,9 @@
       "execution_result_detail": "Result Remark",
       "reply_status": "Reply Status",
       "reply": "Reply Body",
-      "payload": "Payload"
+      "payload": "Payload",
+      "last_reply_time": "Last Reply Time",
+      "reply_email": "Reply Email"
     }
   }
 }
