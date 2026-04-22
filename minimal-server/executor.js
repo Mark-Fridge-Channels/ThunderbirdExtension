@@ -1594,6 +1594,10 @@ function buildInboundCreateProperties(sourceRow, inboundMsg, propNames, keyPerso
     srcPayload?.product_id?.id
   );
   const whoWroteIt = "BGOS";
+  /** 入站实际收件身份（谁收到回信写谁），优先扩展上报的 fcAccount / to_email */
+  const fcResolved =
+    normalizeEmail(inboundMsg.fcAccount || inboundMsg.to_email) || normalizeEmail(sourceRow?.fcAccount);
+
   const mappings = [
     ["Platform", "Email"],
     ["InNOut", "In"],
@@ -1603,7 +1607,7 @@ function buildInboundCreateProperties(sourceRow, inboundMsg, propNames, keyPerso
     [p.executed_at || "Completion Time", new Date(inboundMsg.date || Date.now())],
     [p.execution_result_detail || "Result Remark", inboundMsg.snippet || inboundMsg.subject || "Inbound reply captured"],
     [p.payload || "Payload", JSON.stringify(inboundMsg.payload || {})],
-    ["FCAccount", sourceRow.fcAccount],
+    ["FCAccount", fcResolved],
   ];
 
   // Preserve title field if the database requires one.
@@ -1643,12 +1647,17 @@ function buildInboundCreateProperties(sourceRow, inboundMsg, propNames, keyPerso
   }
 
   const replyEmailCol = String(p.reply_email || "Reply Email").trim();
-  if (!kpTarget && replyEmailCol) {
-    const em = extractEmail(inboundMsg?.authorEmail || inboundMsg?.author || "");
-    if (em) {
-      const rt = getPropertyType(srcPage, replyEmailCol);
-      if (rt === "email") props[replyEmailCol] = notionFromValueByType("email", em);
-    }
+  const replyAuthorEmail = extractEmail(inboundMsg?.authorEmail || inboundMsg?.author || "");
+  if (replyEmailCol && replyAuthorEmail) {
+    const rt = getPropertyType(srcPage, replyEmailCol);
+    if (rt === "email") props[replyEmailCol] = notionFromValueByType("email", replyAuthorEmail);
+  }
+
+  const entityCol = String(p.entity_name || "Entity Name").trim();
+  const entityPageIdForRow = String(inboundMsg.entityPageId || "").trim();
+  if (entityPageIdForRow && entityCol) {
+    const et = getPropertyType(srcPage, entityCol);
+    if (et === "relation") props[entityCol] = { relation: [{ id: entityPageIdForRow }] };
   }
 
   // Extra fields required by InteractionLOG inbound spec.
@@ -1818,6 +1827,9 @@ async function runInboundWatchOnce({ cfg, enqueueAndWait }) {
           ...target,
           subject: target.subject || matchedOut?.subject || "",
           replyText: target.body || "",
+          fcAccount: matchedFc,
+          to_email: matchedFc,
+          entityPageId: String(matchedCache.entityPageId || "").trim(),
           payload: metadataPayload,
         },
         cfg.executor?.notionPropertyNames,
@@ -2790,6 +2802,9 @@ async function handleTbActiveReceiverWebhook(cfg, payload, reqHeaders = {}) {
     author: payload.author,
     authorEmail: author,
     from_email: author,
+    fcAccount: fc,
+    to_email: fc,
+    entityPageId: entityId ? String(entityId) : "",
     payload: interactionPayload,
   };
 

@@ -78,6 +78,7 @@ function loadConfig() {
     external_event_id: "",
     last_reply_time: "Last Reply Time",
     reply_email: "Reply Email",
+    entity_name: "Entity Name",
   };
   const notionPropertyNames = executor?.notion_property_names && typeof executor.notion_property_names === "object"
     ? { ...defaultPropNames, ...executor.notion_property_names }
