@@ -1323,9 +1323,10 @@ async function getCachedSuccessOutRows(cfg) {
 }
 
 /**
- * minimal-server `is_reply`:
- * - In-Reply-To or References contains ≥1 parseable Message-ID, OR
- * - (historical contact: exact or non-consumer domain) AND subject overlap AND inbound body overlaps outbound body.
+ * minimal-server `is_reply`（在实体匹配**之前**执行，须与后续 `participant_match`/domain 不要太脱节）:
+ * - In-Reply-To / References 有可用 Message-ID；或
+ * - 有历史联系（同邮箱或同企业域）+ 能关联到成功出站行 + 主题能匹配；或
+ * - 同上，但**不要求**入站正文包含整段出站正文（OOF/休假/短回执不会与 Outreach 大段 overlap）。
  */
 async function computeIsReplyForWebhook(cfg, payload, cacheMap, fc, author, replyText) {
   const irt = String(payload.inReplyTo || "").trim();
@@ -1353,10 +1354,10 @@ async function computeIsReplyForWebhook(cfg, payload, cacheMap, fc, author, repl
   const inboundBodyNorm = canonicalTextForContains(replyText);
   const outBody = normalizeBodyForAttribution(matchedOut.body || matchedOut.payload?.body || "");
   const outBodyNorm = canonicalTextForContains(outBody);
-  if (!bodyContainsMatch(inboundBodyNorm, outBodyNorm)) {
-    return { isReply: false, reason: "body_no_overlap", matchedOut: null };
+  if (bodyContainsMatch(inboundBodyNorm, outBodyNorm)) {
+    return { isReply: true, reason: "subject_contact_body", matchedOut };
   }
-  return { isReply: true, reason: "subject_contact_body", matchedOut };
+  return { isReply: true, reason: "subject_contact_no_body_overlap", matchedOut };
 }
 
 function buildOutboundCacheCandidates(rows, allowedSenders) {
