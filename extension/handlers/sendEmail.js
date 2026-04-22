@@ -5,6 +5,12 @@
 import { normalizeSendResult } from "../shared/bridgeNormalize.js";
 import { makeError, CODES } from "../shared/errors.js";
 import { waitForAfterSend, cancelAfterSendWait } from "../shared/composeAfterSend.js";
+import {
+  computeSendFingerprint,
+  findRecentDuplicate,
+  recordSend,
+  DEDUP_WINDOW_MS,
+} from "../shared/sendDedupe.js";
 
 const browser = globalThis.browser ?? globalThis.messenger;
 const AFTER_SEND_TIMEOUT_MS = 90000;
@@ -14,6 +20,15 @@ async function resolveIdentity(accountId, identityId) {
   if (!accountId) return null;
   const def = await browser.identities.getDefault(accountId);
   return def?.id ?? null;
+}
+
+async function resolveFromEmail(identityId) {
+  try {
+    const idn = await browser.identities.get(identityId);
+    return idn?.email ?? "";
+  } catch (_) {
+    return "";
+  }
 }
 
 function asRecipientArray(v) {
@@ -67,6 +82,31 @@ export async function handleSendEmail({ payload }) {
     return { success: false, error: makeError(CODES.VALIDATION, "sendMode must be default | sendNow | sendLater") };
   }
 
+  const fromEmail = await resolveFromEmail(identityId);
+  const fingerprint = await computeSendFingerprint({
+    from: fromEmail,
+    to,
+    cc,
+    bcc,
+    subject: payload.subject ?? "",
+    body: String(payload.body),
+  });
+  const dup = await findRecentDuplicate(fingerprint);
+  if (dup) {
+    return {
+      success: false,
+      error: makeError(
+        CODES.DUPLICATE,
+        "duplicate_recent_send: identical (from, to, cc, bcc, subject, body) was already sent within the dedup window",
+        {
+          fingerprint,
+          previousSentAt: new Date(dup.prevAt).toISOString(),
+          windowMs: DEDUP_WINDOW_MS,
+        }
+      ),
+    };
+  }
+
   let composeTabId = null;
   try {
     const tab = await browser.compose.beginNew(undefined, details);
@@ -103,6 +143,7 @@ export async function handleSendEmail({ payload }) {
       // Treat as success to avoid false-negative writeback; keep warning for observability.
       normalized.warnings = ["headerMessageId_missing_after_send"];
     }
+    await recordSend(fingerprint, { from: fromEmail, to });
     return { success: true, result: normalized };
   } catch (e) {
     if (e?.message && /compose\.onAfterSend timeout/i.test(String(e.message))) {

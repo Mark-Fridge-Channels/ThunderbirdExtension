@@ -2795,7 +2795,16 @@ async function handleSentMailWebhook(cfg, payload) {
   pushMany(payload?.to);
   pushMany(payload?.cc);
   pushMany(payload?.bcc);
-  const uniqueRecipients = Array.from(new Set(recipients.map((x) => normalizeEmail(x)).filter(Boolean)));
+  // Defensive filter: drop the sender itself if it somehow ended up in the
+  // recipient list (self-CC/BCC, or upstream fc/recipient mix-up). This
+  // ensures the Email Timeline card never gets From == To.
+  const uniqueRecipients = Array.from(
+    new Set(
+      recipients
+        .map((x) => normalizeEmail(x))
+        .filter((e) => e && e !== fc)
+    )
+  );
   if (uniqueRecipients.length === 0) {
     return { status: 400, body: { ok: false, error: "missing_recipient" } };
   }

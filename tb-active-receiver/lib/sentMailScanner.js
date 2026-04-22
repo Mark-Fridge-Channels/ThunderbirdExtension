@@ -70,6 +70,31 @@ async function writeWatermarks(map) {
   await browser.storage.local.set({ [WATERMARK_KEY]: map });
 }
 
+/**
+ * Return the lowercase email addresses of every identity configured under
+ * the given account (including the default). Used to validate that a Sent
+ * folder message actually was sent by the current user (and not, e.g., an
+ * inbound message that got filed into Sent by a filter / IMAP sync).
+ *
+ * @param {string} accountId
+ * @returns {Promise<Set<string>>}
+ */
+async function getAccountIdentityEmails(accountId) {
+  const out = new Set();
+  if (!accountId) return out;
+  try {
+    const acc = await browser.accounts.get(accountId);
+    const identities = Array.isArray(acc?.identities) ? acc.identities : [];
+    for (const id of identities) {
+      const em = id?.email ? String(id.email).trim().toLowerCase() : "";
+      if (em) out.add(em);
+    }
+  } catch (_) {
+    /* ignore */
+  }
+  return out;
+}
+
 async function findSentFolder(accountId) {
   try {
     const sent = await browser.folders.query({ accountId, specialUse: ["sent"] });
@@ -163,15 +188,57 @@ async function buildSentMailPayload(header) {
   } catch (_) {
     /* message body unavailable */
   }
-  const { to, cc, bcc } = collectRecipients(header);
+  let { to, cc, bcc } = collectRecipients(header);
   const sentAt = asIso(header?.date, new Date().toISOString());
+
+  // Resolve fcAccount (the true sender) with strict validation:
+  //   1. Prefer header.author if — and only if — the extracted email is one
+  //      of the account's configured identity emails. This prevents messages
+  //      that were filed into "Sent" by mistake (filters, IMAP sync, drag &
+  //      drop) from being reported with the counterpart's address as From.
+  //   2. Otherwise fall back to the account's default identity email.
+  //   3. As a last resort (accounts without identities — e.g. Local Folders),
+  //      still trust header.author so we don't silently drop messages.
   const authorEmail = extractEmailFromRecipient(header?.author);
-  const fcAccount = authorEmail || (await resolveDefaultIdentityEmail(accountId));
+  const identityEmails = await getAccountIdentityEmails(accountId);
+  const defaultIdentity = await resolveDefaultIdentityEmail(accountId);
+  let fcAccount = "";
+  let fcResolvedBy = "none";
+  if (authorEmail && identityEmails.has(authorEmail)) {
+    fcAccount = authorEmail;
+    fcResolvedBy = "header_author_matches_identity";
+  } else if (defaultIdentity) {
+    fcAccount = defaultIdentity;
+    fcResolvedBy = authorEmail
+      ? "author_not_in_identities_fallback_default"
+      : "no_author_fallback_default";
+  } else if (authorEmail) {
+    fcAccount = authorEmail;
+    fcResolvedBy = "no_identity_configured_trust_author";
+  }
+
+  // Defensive: drop fcAccount from recipient lists so a self-CC/BCC doesn't
+  // accidentally become the To address in the Email Timeline card.
+  if (fcAccount) {
+    const notSelf = (e) => e !== fcAccount;
+    to = to.filter(notSelf);
+    cc = cc.filter(notSelf);
+    bcc = bcc.filter(notSelf);
+  }
+
+  if (authorEmail && fcAccount && authorEmail !== fcAccount) {
+    console.warn(
+      `[TB Active Receiver][sentMail] author=${authorEmail} is NOT one of the account identities (${Array.from(identityEmails).join(",") || "(none)"}); falling back to fcAccount=${fcAccount} (reason=${fcResolvedBy}) accountId=${accountId} messageId=${header?.id}`
+    );
+  }
+
   return {
     schemaVersion: 1,
     type: "tb-active-receiver.sentMail",
     sentAt,
     fcAccount,
+    fcResolvedBy,
+    rawAuthor: header?.author || "",
     accountId,
     folderId: header?.folder?.id ?? null,
     messageId: header.id,
@@ -206,9 +273,11 @@ async function postPayload(url, body, secret) {
  * @returns {Promise<{ perAccount: Array<{accountId:string, scanned:number, posted:number, skipped:number, failed:number}>, totalPosted:number }>}
  */
 export async function scanSentMailAllAccounts(opts = {}) {
+  const runStartedAt = Date.now();
   const options = await state.loadOptions();
   const reportUrl = options.reportUrl ? String(options.reportUrl).trim() : "";
   if (!reportUrl) {
+    console.warn("[TB Active Receiver][sentMail] abort: no reportUrl configured");
     return { perAccount: [], totalPosted: 0, error: "no_report_url" };
   }
   const secret = options.reportSecret ?? "";
@@ -236,16 +305,22 @@ export async function scanSentMailAllAccounts(opts = {}) {
     }
   }
 
+  console.log(
+    `[TB Active Receiver][sentMail] scan start mode=${entireSent ? "entire" : "recent"} lookbackDays=${lookbackDays} accounts=${accountIds.length} reportUrl=${reportUrl}`
+  );
+
   const watermarks = await readWatermarks();
   let ack = pruneAck(await readAck());
   const perAccount = [];
   let totalPosted = 0;
 
   for (const accountId of accountIds) {
+    const accStart = Date.now();
     const result = { accountId, scanned: 0, posted: 0, skipped: 0, failed: 0 };
     const sentFolder = await findSentFolder(accountId);
     if (!sentFolder?.id) {
       result.skipped = -1;
+      console.warn(`[TB Active Receiver][sentMail] account=${accountId} no sent folder found — skipping`);
       perAccount.push(result);
       continue;
     }
@@ -263,15 +338,20 @@ export async function scanSentMailAllAccounts(opts = {}) {
       }
     }
 
+    console.log(
+      `[TB Active Receiver][sentMail] account=${accountId} folder="${sentFolder.name ?? sentFolder.path ?? sentFolder.id}" fromDate=${fromDate ? fromDate.toISOString() : "(none)"}`
+    );
+
     let messages = [];
     try {
       messages = await queryMessagesInFolder(sentFolder, fromDate);
     } catch (e) {
-      console.warn("[TB Active Receiver] sentMail query failed", accountId, e?.message ?? e);
+      console.warn("[TB Active Receiver][sentMail] query failed", accountId, e?.message ?? e);
       perAccount.push(result);
       continue;
     }
     result.scanned = messages.length;
+    console.log(`[TB Active Receiver][sentMail] account=${accountId} scanned=${messages.length}`);
 
     let newestIsoForAccount = watermarks[accountId] || null;
     for (const header of messages) {
@@ -285,7 +365,7 @@ export async function scanSentMailAllAccounts(opts = {}) {
       try {
         payload = await buildSentMailPayload(header);
       } catch (e) {
-        console.warn("[TB Active Receiver] sentMail build failed", header.id, e?.message ?? e);
+        console.warn("[TB Active Receiver][sentMail] build failed", header.id, e?.message ?? e);
         result.failed += 1;
         continue;
       }
@@ -298,9 +378,15 @@ export async function scanSentMailAllAccounts(opts = {}) {
         if (!newestIsoForAccount || Date.parse(isoSent) > Date.parse(newestIsoForAccount)) {
           newestIsoForAccount = isoSent;
         }
+        const toPreview = Array.isArray(payload.to) ? payload.to.slice(0, 3).join(",") : "";
+        console.log(
+          `[TB Active Receiver][sentMail] posted messageId=${header.id} from=${payload.fcAccount} to=${toPreview} subject="${(payload.subject || "").slice(0, 60)}" status=${post.status}`
+        );
       } else {
         result.failed += 1;
-        // 4xx other than 429 is unrecoverable for same payload — ack it so we don't retry forever.
+        console.warn(
+          `[TB Active Receiver][sentMail] post failed messageId=${header.id} status=${post.status}`
+        );
         if (post.status >= 400 && post.status < 500 && post.status !== 429) {
           ack[key] = new Date().toISOString();
         }
@@ -310,16 +396,25 @@ export async function scanSentMailAllAccounts(opts = {}) {
     if (newestIsoForAccount) {
       watermarks[accountId] = newestIsoForAccount;
     }
+    const accElapsedMs = Date.now() - accStart;
+    console.log(
+      `[TB Active Receiver][sentMail] account=${accountId} done scanned=${result.scanned} posted=${result.posted} skipped=${result.skipped} failed=${result.failed} elapsedMs=${accElapsedMs}`
+    );
     perAccount.push(result);
   }
 
   await writeAck(ack);
   await writeWatermarks(watermarks);
 
+  const totalElapsedMs = Date.now() - runStartedAt;
+  console.log(
+    `[TB Active Receiver][sentMail] scan done totalPosted=${totalPosted} accounts=${perAccount.length} elapsedMs=${totalElapsedMs}`
+  );
   return { perAccount, totalPosted };
 }
 
 /** Reset the watermark + ack (used by "Scan entire Sent" button to re-report). */
 export async function resetSentMailState() {
+  console.log("[TB Active Receiver][sentMail] reset ack + watermarks (entire folder rescan)");
   await browser.storage.local.remove([ACK_KEY, WATERMARK_KEY]);
 }

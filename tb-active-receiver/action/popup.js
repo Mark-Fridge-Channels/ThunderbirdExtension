@@ -59,13 +59,20 @@ document.getElementById("debugLogInbox").addEventListener("click", async () => {
 
 async function runSentMailScan({ entireSent }) {
   const out = document.getElementById("out");
+  const startedAt = Date.now();
+  console.log(`[TB Active Receiver][popup] scanSentMail click mode=${entireSent ? "entire" : "recent"}`);
   const res = await browser.runtime.sendMessage({
     type: "tbActiveRx.scanSentMail",
     entireSent: !!entireSent,
   });
+  const elapsedMs = Date.now() - startedAt;
   if (res?.ok) {
+    console.log(
+      `[TB Active Receiver][popup] scanSentMail result totalPosted=${res.result?.totalPosted ?? 0} accounts=${res.result?.perAccount?.length ?? 0} elapsedMs=${elapsedMs}`
+    );
     out.textContent = JSON.stringify(res.result, null, 2);
   } else {
+    console.warn(`[TB Active Receiver][popup] scanSentMail error: ${res?.error ?? "unknown"}`);
     out.textContent = res?.error ?? "error";
   }
 }
