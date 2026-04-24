@@ -3,6 +3,10 @@
     "mail_automation_agent@markbai.thunderbird.local": {
       "updates": [
         {
+          "version": "1.0.12",
+          "update_link": "https://github.com/Mark-Fridge-Channels/ThunderbirdExtension/releases/download/v1.0.12/extension-1.0.12.xpi"
+        },
+        {
           "version": "1.0.11",
           "update_link": "https://github.com/Mark-Fridge-Channels/ThunderbirdExtension/releases/download/v1.0.11/extension-1.0.11.xpi"
         },

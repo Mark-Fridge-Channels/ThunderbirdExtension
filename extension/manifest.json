@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Mail Automation Agent",
-  "version": "1.0.11",
+  "version": "1.0.12",
   "description": "Local email automation: receive commands via local HTTP server (127.0.0.1:3939) and execute Thunderbird API actions.",
   "author": "markbai",
   "browser_specific_settings": {
