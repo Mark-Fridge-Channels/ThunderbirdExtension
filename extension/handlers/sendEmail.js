@@ -5,6 +5,8 @@
 import { normalizeSendResult } from "../shared/bridgeNormalize.js";
 import { makeError, CODES } from "../shared/errors.js";
 import { waitForAfterSend, cancelAfterSendWait } from "../shared/composeAfterSend.js";
+import { closeComposeTabSafely } from "../shared/composeTabUtils.js";
+import { reconcileSentAfterComposeTimeout } from "../shared/sentReconcile.js";
 import {
   computeSendFingerprint,
   findRecentDuplicate,
@@ -108,12 +110,20 @@ export async function handleSendEmail({ payload }) {
   }
 
   let composeTabId = null;
+  let openedAtMs = 0;
+  const reconcileEnvelope = {
+    to,
+    cc,
+    bcc,
+    subject: payload.subject ?? "",
+  };
   try {
     const tab = await browser.compose.beginNew(undefined, details);
     if (!tab?.id) {
       return { success: false, error: makeError(CODES.API_ERROR, "compose.beginNew did not return a tab") };
     }
     composeTabId = tab.id;
+    openedAtMs = Date.now();
     const afterSendPromise = waitForAfterSend(composeTabId, AFTER_SEND_TIMEOUT_MS);
     const result = await browser.compose.sendMessage(composeTabId, { mode: sendMode });
     const afterSend = await afterSendPromise;
@@ -127,6 +137,11 @@ export async function handleSendEmail({ payload }) {
           `afterSend_error_downgraded: ${afterSend.error}`,
         ]);
       } else {
+        if (composeTabId != null) {
+          cancelAfterSendWait(composeTabId);
+          await closeComposeTabSafely(composeTabId);
+          composeTabId = null;
+        }
         return {
           success: false,
           error: makeError(CODES.API_ERROR, afterSend.error, {
@@ -146,10 +161,30 @@ export async function handleSendEmail({ payload }) {
     await recordSend(fingerprint, { from: fromEmail, to });
     return { success: true, result: normalized };
   } catch (e) {
-    if (e?.message && /compose\.onAfterSend timeout/i.test(String(e.message))) {
+    const isComposeWaitTimeout = e?.message && /compose\.onAfterSend timeout/i.test(String(e.message));
+    if (composeTabId != null) {
+      cancelAfterSendWait(composeTabId);
+      await closeComposeTabSafely(composeTabId);
+      composeTabId = null;
+    }
+    if (isComposeWaitTimeout) {
+      const reconciled = await reconcileSentAfterComposeTimeout({
+        accountId: payload.accountId ?? null,
+        identityId,
+        envelope: reconcileEnvelope,
+        openedAtMs,
+      });
+      if (reconciled) {
+        await recordSend(fingerprint, { from: fromEmail, to });
+        return {
+          success: true,
+          result: reconciled,
+          warnings: ["send_outcome_from_sent_folder_after_compose_timeout"],
+        };
+      }
       return {
         success: false,
-        error: makeError(CODES.TIMEOUT, e.message),
+        error: makeError(CODES.TIMEOUT, e.message, { sentReconcile: "no_matching_message_in_sent" }),
       };
     }
     return {

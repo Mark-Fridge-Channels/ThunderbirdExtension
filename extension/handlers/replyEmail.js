@@ -6,6 +6,8 @@
 import { normalizeSendResult } from "../shared/bridgeNormalize.js";
 import { makeError, CODES } from "../shared/errors.js";
 import { waitForAfterSend, cancelAfterSendWait } from "../shared/composeAfterSend.js";
+import { closeComposeTabSafely } from "../shared/composeTabUtils.js";
+import { reconcileSentAfterComposeTimeout } from "../shared/sentReconcile.js";
 import {
   computeSendFingerprint,
   findRecentDuplicate,
@@ -38,14 +40,6 @@ function composeRecipientsToArray(v) {
   const s = String(v).trim();
   if (!s) return [];
   return s.split(",").map((x) => x.trim()).filter(Boolean);
-}
-
-async function closeComposeTabSafely(tabId) {
-  try {
-    await browser.tabs.remove(tabId);
-  } catch (_) {
-    // Tab may already be gone (e.g. after sendMessage) — ignore.
-  }
 }
 
 const REPLY_TYPES = new Set(["replyToSender", "replyToAll", "replyToList"]);
@@ -96,23 +90,25 @@ export async function handleReplyEmail({ payload }) {
   }
 
   let composeTabId = null;
+  let openedAtMs = 0;
   const fromEmail = await resolveFromEmail(identityId);
   let fingerprint = "";
   let dedupTo = [];
+  let actualTo = [];
+  let actualCc = [];
+  let actualBcc = [];
+  let actualSubject = "";
   try {
     const tab = await browser.compose.beginReply(messageId, replyType, details);
     if (!tab?.id) {
       return { success: false, error: makeError(CODES.API_ERROR, "compose.beginReply did not return a tab") };
     }
     composeTabId = tab.id;
+    openedAtMs = Date.now();
 
     // Recipients and final subject are filled in by Thunderbird based on the
     // original message; read them back before sending so the dedup fingerprint
     // reflects the *actual* outgoing envelope.
-    let actualTo = [];
-    let actualCc = [];
-    let actualBcc = [];
-    let actualSubject = "";
     try {
       const cd = await browser.compose.getComposeDetails(composeTabId);
       actualTo = composeRecipientsToArray(cd?.to);
@@ -154,6 +150,11 @@ export async function handleReplyEmail({ payload }) {
     const result = await browser.compose.sendMessage(composeTabId, { mode: sendMode });
     const afterSend = await afterSendPromise;
     if (afterSend?.error) {
+      if (composeTabId != null) {
+        cancelAfterSendWait(composeTabId);
+        await closeComposeTabSafely(composeTabId);
+        composeTabId = null;
+      }
       return {
         success: false,
         error: makeError(CODES.API_ERROR, afterSend.error, {
@@ -173,10 +174,35 @@ export async function handleReplyEmail({ payload }) {
     if (fingerprint) await recordSend(fingerprint, { from: fromEmail, to: dedupTo });
     return { success: true, result: normalized };
   } catch (e) {
-    if (e?.message && /compose\.onAfterSend timeout/i.test(String(e.message))) {
+    const isComposeWaitTimeout = e?.message && /compose\.onAfterSend timeout/i.test(String(e.message));
+    if (composeTabId != null) {
+      cancelAfterSendWait(composeTabId);
+      await closeComposeTabSafely(composeTabId);
+      composeTabId = null;
+    }
+    if (isComposeWaitTimeout) {
+      const reconciled = await reconcileSentAfterComposeTimeout({
+        accountId: payload.accountId ?? null,
+        identityId,
+        envelope: {
+          to: actualTo,
+          cc: actualCc,
+          bcc: actualBcc,
+          subject: actualSubject,
+        },
+        openedAtMs,
+      });
+      if (reconciled) {
+        if (fingerprint) await recordSend(fingerprint, { from: fromEmail, to: dedupTo });
+        return {
+          success: true,
+          result: reconciled,
+          warnings: ["send_outcome_from_sent_folder_after_compose_timeout"],
+        };
+      }
       return {
         success: false,
-        error: makeError(CODES.TIMEOUT, e.message),
+        error: makeError(CODES.TIMEOUT, e.message, { sentReconcile: "no_matching_message_in_sent" }),
       };
     }
     return {

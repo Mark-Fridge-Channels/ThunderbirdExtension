@@ -169,6 +169,26 @@ function loadConfig() {
       ),
       addressBookId: typeof executor.address_book_id === "string" ? executor.address_book_id.trim() : "",
       notionPropertyNames,
+      /** Optional POST after a new InteractionLOG Notion page is created (inbound reply paths). */
+      interactionLogAdhocWebhook: (() => {
+        const raw = executor?.interaction_log_adhoc_webhook;
+        const postUrl = typeof raw?.post_url === "string" ? raw.post_url.trim() : "";
+        const bearerToken = typeof raw?.bearer_token === "string" ? raw.bearer_token.trim() : "";
+        const notionUrl = typeof raw?.notion_url === "string" ? raw.notion_url.trim() : "";
+        const promptTemplate =
+          typeof raw?.prompt_template === "string" && raw.prompt_template.trim()
+            ? raw.prompt_template.trim()
+            : "TARGET_PAGE_ID={pageId} & help me run @";
+        return {
+          enabled: asBoolean(raw?.enabled, false),
+          postUrl,
+          bearerToken,
+          notionUrl,
+          promptTemplate,
+          timeoutGotoMs: Math.min(600_000, Math.max(1000, asPositiveInt(raw?.timeout_goto_ms, 60_000))),
+          timeoutSendMs: Math.min(600_000, Math.max(1000, asPositiveInt(raw?.timeout_send_ms, 120_000))),
+        };
+      })(),
     },
     logging: {
       enabled: asBoolean(loggingRaw.enabled, true),
@@ -213,6 +233,12 @@ function printConfigSummary(cfg) {
   console.error("  executor.tb_receiver_webhook_secret =", cfg.executor.tbReceiverWebhookSecret ? "(set)" : "(empty)");
   console.error("  executor.tb_report_max_body_bytes =", cfg.executor.tbReportMaxBodyBytes);
   console.error("  executor.address_book_id =", cfg.executor.addressBookId ? cfg.executor.addressBookId : "(empty)");
+  const adhoc = cfg.executor.interactionLogAdhocWebhook;
+  console.error(
+    "  executor.interaction_log_adhoc_webhook.enabled =",
+    adhoc.enabled,
+    adhoc.postUrl ? `(post_url=${adhoc.postUrl})` : ""
+  );
   console.error("  logging.enabled =", cfg.logging.enabled);
   console.error("  logging.directory =", cfg.logging.directory);
   console.error("  logging.mirror_console =", cfg.logging.mirrorConsole);

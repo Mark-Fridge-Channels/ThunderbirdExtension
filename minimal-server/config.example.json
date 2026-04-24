@@ -26,6 +26,15 @@
     "inbound_dedupe_path": "inbound-dedupe-keys.json",
     "tb_receiver_report_path": "/tb-active-receiver/report",
     "tb_receiver_webhook_secret": "",
+    "interaction_log_adhoc_webhook": {
+      "enabled": false,
+      "post_url": "http://34.197.192.45/api/webhook/adhoc",
+      "bearer_token": "",
+      "notion_url": "https://www.notion.so/Email-Reply-5f4c870500c048f080703fe4fbb28cb3",
+      "prompt_template": "TARGET_PAGE_ID={pageId} & help me run @",
+      "timeout_goto_ms": 60000,
+      "timeout_send_ms": 120000
+    },
     "tb_report_max_body_bytes": 104857600,
     "address_book_id": "",
     "notion_property_names": {

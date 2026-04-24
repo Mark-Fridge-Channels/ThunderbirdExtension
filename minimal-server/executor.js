@@ -1912,7 +1912,11 @@ async function runInboundWatchOnce({ cfg, enqueueAndWait }) {
         matchedCache.keyPersonId
       );
       if (Object.keys(createProps).length === 0) continue;
-      await createPage(notionCfg, databaseId, createProps);
+      const createdInboundLog = await createPage(notionCfg, databaseId, createProps);
+      const inboundLogPageId = String(createdInboundLog?.id || "").trim();
+      if (inboundLogPageId) {
+        await postInteractionLogAdhocWebhook(cfg, inboundLogPageId);
+      }
       if (matchedOut) {
         await markReplyDone(cfg, matchedOut, `inbound_reply_detected:${target.headerMessageId || target.messageId}`);
       }
@@ -2949,6 +2953,70 @@ async function handleSentMailWebhook(cfg, payload) {
 }
 
 /**
+ * After a new InteractionLOG Notion page is created for an inbound reply, optionally POST to an external adhoc runner.
+ * Does not throw; logs HTTP or network failures.
+ *
+ * @param {object} cfg loadConfig()
+ * @param {string} pageId Notion page id returned from createPage
+ * @returns {Promise<object>}
+ */
+async function postInteractionLogAdhocWebhook(cfg, pageId) {
+  const wh = cfg?.executor?.interactionLogAdhocWebhook;
+  if (!wh?.enabled) return { skipped: true, reason: "disabled" };
+  const postUrl = String(wh.postUrl || "").trim();
+  const bearerToken = String(wh.bearerToken || "").trim();
+  const notionUrl = String(wh.notionUrl || "").trim();
+  const pid = String(pageId || "").trim();
+  if (!postUrl || !bearerToken || !notionUrl || !pid) {
+    console.error("[executor][interaction-log-adhoc] skip: incomplete config or page id", {
+      hasPostUrl: !!postUrl,
+      hasBearerToken: !!bearerToken,
+      hasNotionUrl: !!notionUrl,
+      hasPageId: !!pid,
+    });
+    return { skipped: true, reason: "incomplete_config_or_page" };
+  }
+  const tpl = String(wh.promptTemplate || "TARGET_PAGE_ID={pageId} & help me run @");
+  const prompt = tpl.replace(/\{pageId\}/g, pid);
+  const body = {
+    url: notionUrl,
+    prompt,
+    timeoutGotoMs: wh.timeoutGotoMs,
+    timeoutSendMs: wh.timeoutSendMs,
+  };
+  try {
+    const res = await fetch(postUrl, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${bearerToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    const text = await res.text();
+    let data = {};
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      data = { raw: text };
+    }
+    if (!res.ok) {
+      console.error("[executor][interaction-log-adhoc] HTTP error", res.status, String(text).slice(0, 500));
+      return { ok: false, httpStatus: res.status, error: String(text).slice(0, 400) };
+    }
+    return {
+      ok: data.accepted === true,
+      accepted: data.accepted === true,
+      jobId: data.jobId != null ? String(data.jobId) : "",
+      httpStatus: res.status,
+    };
+  } catch (e) {
+    console.error("[executor][interaction-log-adhoc] fetch failed", e?.message ?? e);
+    return { ok: false, error: e?.message ?? String(e) };
+  }
+}
+
+/**
  * TB Active Receiver: POST JSON webhook → optional contact-cache filter → Notion In row.
  * Headers: optional `X-TB-Receiver-Secret` when `executor.tb_receiver_webhook_secret` is set.
  *
@@ -3159,6 +3227,8 @@ async function handleTbActiveReceiverWebhook(cfg, payload, reqHeaders = {}) {
 
   let interactionLogCreated = false;
   let interactionLogError = null;
+  let interactionLogPageId = "";
+  let interactionLogAdhocWebhook = null;
   if (templateRow) {
     try {
       const createProps = buildInboundCreateProperties(
@@ -3167,8 +3237,12 @@ async function handleTbActiveReceiverWebhook(cfg, payload, reqHeaders = {}) {
         propNames,
         keyPersonId
       );
-      await createPage(notionCfg, databaseId, createProps);
-      interactionLogCreated = true;
+      const createdInteractionLog = await createPage(notionCfg, databaseId, createProps);
+      interactionLogPageId = String(createdInteractionLog?.id || "").trim();
+      interactionLogCreated = !!interactionLogPageId;
+      if (interactionLogPageId) {
+        interactionLogAdhocWebhook = await postInteractionLogAdhocWebhook(cfg, interactionLogPageId);
+      }
       if (matchedOutForLog?.pageId) {
         await markReplyDone(
           cfg,
@@ -3279,7 +3353,9 @@ async function handleTbActiveReceiverWebhook(cfg, payload, reqHeaders = {}) {
       classification,
       outboundPageId: outboundPageId || "",
       interactionLogCreated,
+      interactionLogPageId: interactionLogPageId || undefined,
       interactionLogError: interactionLogError || undefined,
+      interactionLogAdhocWebhook: interactionLogAdhocWebhook || undefined,
       emailTimelineCardCreated,
       emailTimelineAlreadyExisted: emailTimelineAlreadyExisted || undefined,
       emailTimelineError: emailTimelineError || undefined,
