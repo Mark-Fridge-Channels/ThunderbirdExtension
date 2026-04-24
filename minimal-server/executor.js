@@ -1740,9 +1740,15 @@ async function writeEmailTimelineCard(cfg, entityPageId, card) {
   } catch (e) {
     console.error("[executor][email-timeline] writeEmailTimelineCard failed", {
       entityPageId: id,
+      code: e?.code || null,
+      from: card?.from || "",
+      to: card?.to || "",
+      hasSubject: !!String(card?.subject || "").trim(),
+      hasBody: !!String(card?.body || "").trim(),
+      hasDate: !!card?.date,
       error: e?.message ?? String(e),
     });
-    return { ok: false, error: e?.message ?? String(e) };
+    return { ok: false, error: e?.message ?? String(e), code: e?.code || undefined };
   }
 }
 
@@ -1915,15 +1921,27 @@ async function runInboundWatchOnce({ cfg, enqueueAndWait }) {
         const inboundSubject = target.subject || matchedOut?.subject || "";
         const inboundBody = target.body || "";
         const inboundDate = target.date instanceof Date ? target.date : (target.date ? new Date(target.date) : new Date());
-        await writeEmailTimelineCard(cfg, entityForTimeline, {
-          kind: "Inbound Reply",
-          title: `[Inbound Reply] ${inboundSubject || "(no subject)"}`,
-          date: inboundDate,
-          from: authorEmail,
-          to: matchedFc,
-          subject: inboundSubject,
-          body: stripHtmlToPlain(inboundBody),
-        });
+        const fromForCard = normalizeEmail(authorEmail);
+        const toForCard = normalizeEmail(matchedFc);
+        if (!fromForCard || !toForCard) {
+          console.error("[executor][email-timeline] inbound capture skipped: missing from/to", {
+            entityPageId: entityForTimeline,
+            authorEmail,
+            matchedFc,
+            headerMessageId: target.headerMessageId,
+            messageId: target.messageId,
+          });
+        } else {
+          await writeEmailTimelineCard(cfg, entityForTimeline, {
+            kind: "Inbound Reply",
+            title: `[Inbound Reply] ${inboundSubject || "(no subject)"}`,
+            date: inboundDate,
+            from: fromForCard,
+            to: toForCard,
+            subject: inboundSubject,
+            body: stripHtmlToPlain(inboundBody),
+          });
+        }
       }
       existingInboundDedupKeys.add(dedupKey);
       addDedupeKey(cfg, dedupKey);
@@ -2235,17 +2253,34 @@ async function successWriteback({ cfg, row, detail, externalEventId, payloadText
       const to = normalizeEmail(partnerEmailResolved || row?.counterpartyEmail || "");
       const from = normalizeEmail(row?.fcAccount || "");
       const subject = String(row?.subject || "").trim();
+      const subjectForCard = kind === "Reply" && !/^re:/i.test(subject) ? `Re: ${subject}` : subject;
       const titlePrefix = kind === "Reply" && !/^re:/i.test(subject) ? "Re: " : "";
       const title = `[${kind}] ${titlePrefix}${subject || "(no subject)"}`;
-      await writeEmailTimelineCard(cfg, entityPageId, {
-        kind,
-        title,
-        date: new Date(),
-        from,
-        to,
-        subject: kind === "Reply" && !/^re:/i.test(subject) ? `Re: ${subject}` : subject,
-        body: stripHtmlToPlain(row?.body || ""),
-      });
+      // Refuse to write if the essential identifiers are missing — better to
+      // skip the card than to publish a row with blank From/To. Subject/Body
+      // are auto-filled with placeholders by emailTimeline.normalizeAndValidateCard.
+      if (!from || !to) {
+        console.error("[executor][email-timeline] outbound writeback skipped: missing from/to", {
+          taskId: row?.taskId,
+          pageId: row?.pageId,
+          action: row?.actionText,
+          from,
+          to,
+          partnerEmailResolved: partnerEmailResolved || null,
+          counterpartyEmail: row?.counterpartyEmail || null,
+          fcAccount: row?.fcAccount || null,
+        });
+      } else {
+        await writeEmailTimelineCard(cfg, entityPageId, {
+          kind,
+          title,
+          date: new Date(),
+          from,
+          to,
+          subject: subjectForCard,
+          body: stripHtmlToPlain(row?.body || ""),
+        });
+      }
     }
   } catch (e) {
     console.error("[executor] email timeline card write (outbound) failed", {
@@ -3162,11 +3197,16 @@ async function handleTbActiveReceiverWebhook(cfg, payload, reqHeaders = {}) {
   if (entityId) {
     const subjectText = String(payload.subject || "").trim();
     const cardTitle = `[${classification}] ${subjectText || "(no subject)"}`;
+    // BUG FIX: previously used String(payload.author || author).trim(), which
+    // wrote the RAW header (e.g. "John Doe <john@example.com>") into From.
+    // Other paths store clean email-only — use the already-extracted `author`
+    // (lowercased email) for consistency across send/reply/listen paths.
+    const fromEmail = normalizeEmail(author) || normalizeEmail(extractEmail(payload?.author || ""));
     const timelineRes = await writeEmailTimelineCard(cfg, entityId, {
       kind: classification,
       title: cardTitle,
       date: timestamp,
-      from: String(payload.author || author || "").trim(),
+      from: fromEmail,
       to: fc,
       subject: subjectText,
       body: replyText,

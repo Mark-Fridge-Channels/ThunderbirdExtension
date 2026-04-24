@@ -139,6 +139,61 @@ function titleProp(value) {
   };
 }
 
+/** Stable placeholders so the inline database always has something to display. */
+const PLACEHOLDER_SUBJECT = "(no subject)";
+const PLACEHOLDER_BODY = "(empty body)";
+
+/**
+ * Validate and normalize all fields BEFORE writing to Notion. Throws when a
+ * mandatory field is missing or unparseable so the caller logs and skips the
+ * card instead of writing garbage. Optional fields (subject, body, title)
+ * are auto-filled with placeholders to keep the inline database clean.
+ *
+ * Mandatory: from, to, date.
+ * Auto-filled: subject, body, title.
+ */
+function normalizeAndValidateCard(card) {
+  const fromRaw = String(card?.from ?? "").trim();
+  if (!fromRaw) {
+    const err = new Error("emailTimeline: missing required field 'from'");
+    err.code = "MISSING_FROM";
+    throw err;
+  }
+  const toRaw = String(card?.to ?? "").trim();
+  if (!toRaw) {
+    const err = new Error("emailTimeline: missing required field 'to'");
+    err.code = "MISSING_TO";
+    throw err;
+  }
+  let date;
+  if (card?.date instanceof Date && Number.isFinite(card.date.valueOf())) {
+    date = card.date;
+  } else if (typeof card?.date === "string" && card.date.trim()) {
+    const d = new Date(card.date);
+    if (!Number.isFinite(d.valueOf())) {
+      const err = new Error(`emailTimeline: invalid date string '${card.date}'`);
+      err.code = "INVALID_DATE";
+      throw err;
+    }
+    date = d;
+  } else if (typeof card?.date === "number" && Number.isFinite(card.date)) {
+    date = new Date(card.date);
+  } else {
+    const err = new Error("emailTimeline: missing required field 'date'");
+    err.code = "MISSING_DATE";
+    throw err;
+  }
+  const subjectRaw = String(card?.subject ?? "").trim();
+  const subject = subjectRaw || PLACEHOLDER_SUBJECT;
+  const bodyRaw = String(card?.body ?? "");
+  // body keeps internal whitespace, but if the entire string is whitespace we
+  // treat it as empty and substitute a placeholder.
+  const body = bodyRaw.trim() ? bodyRaw : PLACEHOLDER_BODY;
+  const titleRaw = String(card?.title ?? "").trim();
+  const title = titleRaw || subject;
+  return { from: fromRaw, to: toRaw, date, subject, body, title };
+}
+
 /** Build Notion date property for a JS Date/ISO string, with time, no end. */
 function dateTimeProp(date) {
   let iso = "";
@@ -269,13 +324,18 @@ async function createEmailTimelineCard(cfg, entityPageId, card) {
   const entityId = String(entityPageId || "").trim();
   if (!entityId) throw new Error("createEmailTimelineCard: entityPageId required");
 
+  // Strict normalization: throws on missing mandatory fields, fills
+  // optional ones with placeholders. Both dedup and create use the *same*
+  // normalized values so we never store one form and look up another.
+  const normalized = normalizeAndValidateCard(card);
+
   // If the inline database already exists, look for a matching row before
   // creating. A brand-new database cannot contain a duplicate, so in that
   // case we fall through straight to create.
   const existingDbId = await findEmailTimelineDatabaseId(notionCfg, entityId);
   if (existingDbId) {
     try {
-      const dupPageId = await findExistingTimelineCardId(notionCfg, existingDbId, card);
+      const dupPageId = await findExistingTimelineCardId(notionCfg, existingDbId, normalized);
       if (dupPageId) {
         return {
           databaseId: existingDbId,
@@ -296,14 +356,13 @@ async function createEmailTimelineCard(cfg, entityPageId, card) {
 
   const databaseId = existingDbId || (await createEmailTimelineDatabase(notionCfg, entityId));
   if (!databaseId) throw new Error("ensureEmailTimelineDatabase: no database id returned");
-  const bodyText = clampText(card?.body || "", 1900);
   const properties = {
-    Title: titleProp(card?.title || card?.subject || ""),
-    Date: dateTimeProp(card?.date),
-    From: richTextProp(card?.from || ""),
-    To: richTextProp(card?.to || ""),
-    Subject: richTextProp(card?.subject || ""),
-    Body: richTextProp(bodyText),
+    Title: titleProp(normalized.title),
+    Date: dateTimeProp(normalized.date),
+    From: richTextProp(normalized.from),
+    To: richTextProp(normalized.to),
+    Subject: richTextProp(normalized.subject),
+    Body: richTextProp(clampText(normalized.body, 1900)),
   };
   const created = await createPageInDatabase(notionCfg, databaseId, properties);
   return { databaseId, pageId: created?.id || "" };
@@ -316,10 +375,13 @@ function clearEmailTimelineCache() {
 
 module.exports = {
   EMAIL_TIMELINE_DB_NAME,
+  PLACEHOLDER_SUBJECT,
+  PLACEHOLDER_BODY,
   findEmailTimelineDatabaseId,
   findExistingTimelineCardId,
   createEmailTimelineDatabase,
   ensureEmailTimelineDatabase,
   createEmailTimelineCard,
+  normalizeAndValidateCard,
   clearEmailTimelineCache,
 };
