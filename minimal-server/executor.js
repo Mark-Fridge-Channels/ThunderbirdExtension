@@ -427,6 +427,57 @@ function normalizeEmail(text) {
   return extractEmail(text || "").trim().toLowerCase();
 }
 
+/**
+ * Detect bounce / NDR (e.g. Office 365 "Undeliverable:") so we can attribute to the failed recipient, not Mailer-Daemon.
+ */
+function looksLikeNonDeliveryReport(subject, bodyText, fromEmail) {
+  const sub = String(subject || "").trim();
+  const body = String(bodyText || "");
+  const from = String(fromEmail || "").toLowerCase();
+  const local = from.includes("@") ? from.split("@")[0] : from;
+
+  if (/^\s*undeliverable\s*:/i.test(sub)) return true;
+  if (/delivery\s+status\s+notification/i.test(sub)) return true;
+  if (/^returned\s+mail:/i.test(sub)) return true;
+  if (/mail\s+delivery\s+failed/i.test(sub)) return true;
+  if (/failure\s+notice/i.test(sub)) return true;
+
+  if (/your\s+message\s+to\s+\S+@\S+\s+couldn'?t\s+be\s+delivered/i.test(body)) return true;
+  if (/couldn'?t\s+be\s+delivered\.?\s*when\s+office\s+365/i.test(body)) return true;
+
+  if (/^(mailer-daemon|postmaster)\b/i.test(local)) {
+    if (/recipient\s+address|final-recipient|diagnostic-code|original\s+recipient/i.test(body)) return true;
+  }
+  return false;
+}
+
+function extractNdrRecipientEmail(bodyText) {
+  const body = String(bodyText || "");
+  const patterns = [
+    /your\s+message\s+to\s+([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})/i,
+    /recipient\s+address:\s*([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})/i,
+    /final-recipient:\s*(?:RFC822|rfc822);?\s*([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})/i,
+    /original\s+recipient:\s*(?:RFC822|rfc822);?\s*([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})/i,
+  ];
+  for (const re of patterns) {
+    const m = body.match(re);
+    if (m) {
+      const em = normalizeEmail(m[1]);
+      if (em) return em;
+    }
+  }
+  return "";
+}
+
+/**
+ * @returns {string} normalized failed recipient, or "" if not an NDR we recognize
+ */
+function resolveNdrCounterpartyEmail({ subject, bodyPlain, bodyHtml, fromAuthor }) {
+  const bodyBlob = [String(bodyPlain || ""), stripHtmlToPlain(String(bodyHtml || ""))].filter(Boolean).join("\n");
+  if (!looksLikeNonDeliveryReport(subject, bodyBlob, fromAuthor)) return "";
+  return extractNdrRecipientEmail(bodyBlob);
+}
+
 function buildInboundCacheKey(fcAccount, counterpartyEmail) {
   return `${normalizeEmail(fcAccount)}|${normalizeEmail(counterpartyEmail)}`;
 }
@@ -3070,8 +3121,8 @@ async function handleTbActiveReceiverWebhook(cfg, payload, reqHeaders = {}) {
   }
 
   const fc = normalizeEmail(payload.fcAccount);
-  const author = extractEmail(payload.author);
-  if (!fc || !author) {
+  const fromAuthor = extractEmail(payload.author);
+  if (!fc || !fromAuthor) {
     return { status: 400, body: { ok: false, error: "missing_fc_account_or_author" } };
   }
 
@@ -3080,6 +3131,14 @@ async function handleTbActiveReceiverWebhook(cfg, payload, reqHeaders = {}) {
   const bodyPlain = typeof payload.bodyPlain === "string" ? payload.bodyPlain : "";
   const bodyHtml = typeof payload.bodyHtml === "string" ? payload.bodyHtml : "";
   const replyText = bodyPlain.trim() ? bodyPlain : stripHtmlToPlain(bodyHtml);
+
+  const ndrCounterparty = resolveNdrCounterpartyEmail({
+    subject: payload.subject,
+    bodyPlain,
+    bodyHtml,
+    fromAuthor,
+  });
+  const author = ndrCounterparty || fromAuthor;
 
   const replyProbe = await computeIsReplyForWebhook(cfg, payload, cacheMap, fc, author, replyText);
   if (!replyProbe.isReply) {
